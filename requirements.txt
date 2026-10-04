@@ -1,0 +1,20 @@
+# 核心依赖 (Python >= 3.9)
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+Pillow>=10.0
+tqdm>=4.65
+
+# 数据准备 (Parquet → JPG)
+pyarrow>=14.0
+
+# 第三方 OCR (自适应监督与里程碑评测; 缺失时训练自动降级)
+ddddocr>=1.5
+ppllocr>=2.0
+opencv-python>=4.8
+onnxruntime>=1.16
+
+# 华为昇腾 NPU (可选, 仅 NPU 环境安装)
+# torch-npu>=2.1
