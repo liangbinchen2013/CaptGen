@@ -67,13 +67,13 @@ PASS M8 CaptchaResNet整图acc:     0.9460   target[>=0.85]
 ![OCR / gap / 判别器曲线](docs/ocr_curves.png)
 
 - **G/D Loss**：G 预热期仅辅助损失；对抗权重引入后 G Loss 上升属正常现象，
-  随后稳定在 0.6~0.7；D Loss 稳定在 1.2~1.6。
+  随后稳定在 0.6 \~ 0.7；D Loss 稳定在 1.2 \~ 1.6。
 - **视觉正则**：Edge / Realism / Diversity 均随训练收敛；Contrast 损失接近 0，
   说明生成图对比度已落在真实数据分布带内。
 - **D Grad Norm** 后期升高但训练稳定（有梯度裁剪）；R1/R2 保持 O(1)。
 - **OCR 曲线**：Phase A（Ep1-100）仅 CaptchaResNet 强引导；Ep100 起接入
   第三方 OCR，ddddocr 于 Ep400 达到 80.6%，与真实 79.8% 基本重合。
-- **gap 墨迹比**：全程稳定在真实水平（0.79~0.84），无硬切间隙。
+- **gap 墨迹比**：全程稳定在真实水平（0.79 \~ 0.84），无硬切间隙。
 
 ---
 
