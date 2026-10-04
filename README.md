@@ -1,5 +1,7 @@
 # 验证码生成 AI
 
+[中文文档](README.md) | [English](README_EN.md)
+
 基于 **AC-GAN**（条件生成对抗网络）的 4 位字母数字验证码生成器。
 目标不是单纯"生成好看图片"，而是让生成结果同时满足：
 
@@ -210,13 +212,24 @@ pip install -r requirements.txt
 
 ### 数据准备
 
-1. 原始 Parquet → JPG（每 500 张一个目录）：
+训练数据托管在 Hugging Face：
+**https://huggingface.co/datasets/liangbinchen2013/CaptGen**
+
+下载仓库中的 `data.zip` 并在项目根目录解压，即可得到 `训练数据/`
+（149,888 张验证码，每 500 张一个 `batch_*` 目录）：
 
 ```bash
-python extract_parquet.py
+# 下载 (需要 pip install huggingface_hub)
+huggingface-cli download liangbinchen2013/CaptGen data.zip --repo-type dataset --local-dir .
+
+# 解压 (Windows 10+ 可用 tar, 或直接用资源管理器解压)
+tar -xf data.zip
 ```
 
-2. （可选）统计真实数据 OCR 错误画像，生成 `confusion_profile.json`：
+> 若只持有原始 Parquet 文件，可运行 `python extract_parquet.py`
+> 生成同样结构的 `训练数据/`。
+
+（可选）统计真实数据 OCR 错误画像，重新生成 `confusion_profile.json`：
 
 ```bash
 python OCR_confusion_finding.py        # 全量跑 ddddocr / ppllocr, 生成 ocr_error_stats_*.txt
@@ -295,6 +308,8 @@ python human_feedback_gui.py                        # 人工反馈收集 GUI (�
 ## 项目结构
 
 ```
+├── README.md                  # 中文说明 (本文件)
+├── README_EN.md               # English documentation
 ├── config.py                  # 全局配置 (数据/模型/损失/课程学习/设备自适应)
 ├── models.py                  # Generator / Discriminator / EMA
 ├── train.py                   # 训练入口 (D 预训练 → G 预热 → 对抗 → 课程学习)
@@ -319,7 +334,8 @@ python human_feedback_gui.py                        # 人工反馈收集 GUI (�
 ├── ocr_error_stats_*.txt      # 双 OCR 全量错误统计 (中间产物)
 ├── OCR/best_captcha_resnet.pth# CaptchaResNet 权重
 ├── docs/                      # README 配图 (曲线 / 样例)
-├── 训练数据/batch_*/          # 训练集 (149,888 张)
+├── data.zip                   # 训练数据压缩包 (来自 Hugging Face)
+├── 训练数据/batch_*/          # 训练集 (149,888 张, data.zip 解压结果)
 └── output_v28/                # 训练输出 (checkpoint / 样例 / 日志)
 ```
 
@@ -339,4 +355,12 @@ python human_feedback_gui.py                        # 人工反馈收集 GUI (�
   发布/部署只需保留最终 `checkpoint_epoch_400.pt` 与 `training_log.csv`；
 - **性能参考**：RTX 3070、batch=128 训练 400 epochs 约 4.5 天，
   约 1.2 step/s；NPU（昇腾 910B3）会自动切换到 batch=1024。
+
+## 参考
+
+- SNGAN / Hinge Loss: Miyato et al., 2018
+- StyleGAN2-ADA: Karras et al., NeurIPS 2020
+- R1 + R2 正则: Mescheder et al., 2018; R3GAN, Huang et al., NeurIPS 2024
+- ReACGAN: Kang et al., NeurIPS 2021
+- Minibatch StdDev: Progressive GANs, Karras et al., 2018
 
