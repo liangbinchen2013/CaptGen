@@ -61,6 +61,10 @@ PASS M8 CaptchaResNet整图acc:     0.9460   target[>=0.85]
 
 > M3 为参考指标：生成图的混淆分布与真实画像尚未完全重合，
 > 可通过延长 Phase C（混淆软目标）训练进一步收敛。
+>
+> 注：上表为 v28 发布时的报告文本。当前 `evaluate_generated.py` 已修正
+> M3 口径（`<LEN>` 键解析 + 完美生成器噪声下限），v28 复评 M3 raw≈0.2532、
+> 超额≈0.078，并新增 M9（v28 多 seed 均值 0.2188）。
 
 ### 训练 Loss 曲线
 
@@ -76,6 +80,88 @@ PASS M8 CaptchaResNet整图acc:     0.9460   target[>=0.85]
 - **OCR 曲线**：Phase A（Ep1-100）仅 CaptchaResNet 强引导；Ep100 起接入
   第三方 OCR，ddddocr 于 Ep400 达到 80.6%，与真实 79.8% 基本重合。
 - **gap 墨迹比**：全程稳定在真实水平（0.79 \~ 0.84），无硬切间隙。
+
+---
+
+## v2.5ep 微调：在 v28 上继续贴近真实机器画像
+
+v28 是当前发布基线，但独立评测仍有一个明确缺口：**M9 归一化超额混淆对
+top10 和 = 0.2188（多 eval seed 均值），目标 ≤ 0.10**。v2 在 v28 权重上
+做 5 epoch 短程微调，不重新训练、不改 v28 训练配方。
+
+### 配方（`finetune_v28_v2.py`）
+
+1. **初始化**：G 从 v28 EMA 初始化（不是 train 权重），D 从 v28 原值；EMA 同步。
+2. **冻结 BN running stats（G 8 个 / D 4 个）**：v28 的 `up1.bn2.running_var`
+   已漂移到 ≈1.9e6，继续更新会让 ppll 评测不稳定。
+3. **保存顺序**：先存 checkpoint，再做 sample 前向，避免 `EMAGenerator` 的
+   BN buffer 被样例前向污染（v28 G/EMA BN buffer 最大差 37912）。
+4. **per-OCR adaptive ε**：用 v28 ep400 的 `gen_error_stats_*` 计算
+   `ε_c = max(0, 真实错误率_c − 生成错误率_c)`，默认 dddd+ppll 合并。
+   过混淆字符 ε=0 → 回到硬 CE；欠混淆字符补混淆。
+5. **ppll pair-hard CE**：对 ppll 命中"头部超额混淆对"的位加 0.5 权重；
+   实际覆盖率仅约 0.03%，是辅助项而非主杠杆。
+6. **多 seed 守卫**：ep5/10/15 各跑 seed 41/42/43 × n=2000；任一 seed
+   在 M1/M2/M4/M6/M8 失败即不选为 best。
+7. **短程调度**：5 epoch，cosine `T_max=15`，lr 1e-5 → 5e-6。
+   与选定 run 的 ep5 学习率一致，可复现。
+
+### 训练命令
+
+```bash
+# 前置: v28 训练产物
+#   output_v28/checkpoint_epoch_400.pt
+#   output_v28/gen_error_stats_{ddddocr,ppllocr}_ep400.txt
+# 若统计文件尚未生成, 先跑一次同 tag 的评测:
+python evaluate_generated.py --ckpt output_v28/checkpoint_epoch_400.pt --n 2000 --tag ep400
+
+python finetune_v28_v2.py
+
+# 自定义路径
+python finetune_v28_v2.py \
+  --base-ckpt path/to/checkpoint_epoch_400.pt \
+  --data-dir path/to/训练数据 \
+  --eps-stats-prefix path/to/gen_error_stats \
+  --output-dir output_v2_5ep
+```
+
+产物：`output_v2_5ep/checkpoint_v2_5ep.pt`（best 别名）、
+`v2_5ep_metrics.json`、逐 seed 评测报告。
+
+### 结果（ep5，n=2000，3 seed 均值）
+
+| 指标 | v28 基线 | v2.5ep | 判定 |
+|---|---|---|---|
+| M1 ddddocr acc 比 | 0.9965 | **0.9803** | PASS |
+| M1 ppllocr acc 比 | 0.8789 | **0.8895** | PASS |
+| M2 ddddocr 错误率比 | 0.8531 | **0.9566** | PASS |
+| M2 ppllocr 错误率比 | 1.2355 | **1.2143** | PASS |
+| M3 混淆 JS 超额 | 0.078 | **0.0754** | 参考 |
+| M4 dddd / ppll | 0.73 / 1.22 | 0.9270 / 1.1982 | PASS |
+| M6 逐字符错误率 MAE | 0.0446 | **0.0450** | PASS |
+| M8 CaptchaResNet（代理） | 0.9460 | **0.9618** | PASS |
+| M9 归一化超额 top10 和 | 0.2188* | **0.2054** | 未达 0.10 |
+| 三 seed 全守卫 | — | **yes** | — |
+
+> *v28 的 M9 是多 eval seed 均值（单次 n=2000 会在 0.18–0.25 间波动）。
+
+### 曲线
+
+![v2 微调 loss 曲线](docs/v2_5ep_loss_curves.png)
+
+![v2 微调评测曲线](docs/v2_5ep_eval_curves.png)
+
+- 微调期间损失基本保持平稳：G/D/Aux/FM 与视觉正则没有明显漂移，
+  说明 5 epoch 只做局部修正，没有把 v28 学到的分布推倒重来。
+- M1/M2 在 ep10/15 开始单项漂移（ppll M1 0.881→0.872，M2 1.241→1.253，
+  M6 0.047→0.049；ep15 seed43 M6=0.0522 触发守卫），因此选定 ep5。
+- M9 仍未达标：0.2054 vs 目标 0.10。改善主要来自 dddd 一侧更贴近真实；
+  n=2000 下 M9 的 seed 间波动约 ±0.03，不能把 0.205 解读为已接近阈值。
+- 像素层面，ep1→ep15 字符区平均绝对差 11.7/255（p99=100），
+  ep1→ep5 为 7.6/255（p99=64）；同权重仅换噪声底仅 0.27/255（p99=3），
+  说明 ep5 之后的差异是真实函数漂移，而非采样噪声。
+
+> v2 的定位是"在 v28 上小步修正"，不是新基线；v28 的 400ep 结果与曲线保持不变。
 
 ---
 
@@ -276,7 +362,7 @@ python generate.py --label-dist uniform                       # 均匀标签 (�
 # 综合质量评估 (像素统计 / OCR 可读性 / 多样性)
 python evaluate.py --checkpoint output_v28/checkpoint_epoch_400.pt
 
-# 里程碑评测: 生成图机器画像 vs 真实画像 (M1-M8)
+# 里程碑评测: 生成图机器画像 vs 真实画像 (M1-M9)
 python evaluate_generated.py --ckpt output_v28/checkpoint_epoch_400.pt --n 2000 --tag release
 
 # 多样性专项检查
@@ -315,7 +401,8 @@ python human_feedback_gui.py                        # 人工反馈收集 GUI (�
 ├── train.py                   # 训练入口 (D 预训练 → G 预热 → 对抗 → 课程学习)
 ├── generate.py                # 推理生成
 ├── evaluate.py                # 综合质量评估
-├── evaluate_generated.py      # 里程碑评测 (生成画像 vs 真实画像)
+├── evaluate_generated.py      # 里程碑评测 (生成画像 vs 真实画像, M1-M9)
+├── finetune_v28_v2.py         # v28 5ep 微调配方 (EMA 初始化 / BN 冻结 / adaptive ε)
 ├── verify_diversity.py        # 生成多样性验证
 ├── adaptive_ocr.py            # 三 OCR 字符级证据权重表 + 自适应权重
 ├── ocr_net.py                 # CaptchaResNet (字形监督 / 可读性代理)
