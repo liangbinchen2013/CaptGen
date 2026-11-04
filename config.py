@@ -47,6 +47,7 @@ LEARNING_RATE_G = 2e-4      # GPU 安全默认, NPU 自动覆盖为 5e-4
 LEARNING_RATE_D = 2e-4
 BETA1 = 0.0                 # SNGAN 标准配置, 配合 SpectralNorm + Hinge Loss
 BETA2 = 0.9
+SEED = 42                   # 默认随机种子 (train.py / finetune_v28_v2.py 可覆盖)
 
 # ─── 模型 ────────────────────────────────────────────────
 LATENT_DIM = 256            # 噪声维度, 决定同标签采样的多样性空间
@@ -93,6 +94,13 @@ M_CHEAT = 0.50              # "高置信独苗"惩罚: C 强命中且 D/P 均未
 M_CONS = 1.10               # D==P 整串一致且 != 标签: 可读性共识奖励
 M_CONS_CAP = 0.95           # 共识奖励后的终值上限
 OCR_VALID_THR = 0.15        # 有效字符权重判定阈值 (统计有效占比用)
+
+# ─── v2 微调扩展: 长度失败样本的权重下限 ─────────────────
+# 默认关闭 (len_apply=None -> 不启用), 保持 v28 训练行为不变;
+# 显式传入 len_apply 时, 第三方 OCR 串长≠4 的样本跳过 M_LEN/M_CHEAT,
+# 权重不低于 LEN_FAIL_MIN_WEIGHT, 避免粘连样本被压到 0.08 地板.
+LEN_FAIL_SKIP_PENALTY = True
+LEN_FAIL_MIN_WEIGHT = 0.60
 
 # ─── 机器混淆画像 (由 build_confusion_profile.py 生成) ────
 # 真实数据上 ddddocr+ppllocr 的全量错误画像:

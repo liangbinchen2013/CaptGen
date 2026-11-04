@@ -33,6 +33,7 @@ from config import (
     W_FLOOR, C_CONF_HI, C_CONF_LO, C_RANK2_PROB,
     M_LEN, M_LEN_MIN, M_CHEAT, M_CONS, M_CONS_CAP,
     CONFUSABLE_PAIRS,
+    LEN_FAIL_SKIP_PENALTY, LEN_FAIL_MIN_WEIGHT,
 )
 
 
@@ -210,7 +211,8 @@ def lookup_weight(c, d, p):
 
 def apply_multipliers(w, d_state, p_state, c_state, conf,
                       d_len_ok, p_len_ok, consensus_wrong,
-                      phase_c=False, d_garbage=False, p_garbage=False):
+                      phase_c=False, d_garbage=False, p_garbage=False,
+                      len_fail=False):
     """
     样本级/位级修正因子:
       M_len  : D 或 P 串长≠4 → ×0.85/个, 叠加下限 M_LEN_MIN
@@ -218,7 +220,12 @@ def apply_multipliers(w, d_state, p_state, c_state, conf,
                Phase C 混淆阶段: 混淆对内 miss 是目标态, 仅越界垃圾预测
                (读成 36 类外字符) 才视为欺骗签名
       M_cons : D==P 整串一致且≠label → ×1.10, 终值 cap M_CONS_CAP
+      len_fail: v2 扩展, 第三方串长≠4 视为结构失败, 跳过上述三项,
+               只保留 LEN_FAIL_MIN_WEIGHT 下限; 默认 False 保持 v28 行为.
     """
+    if len_fail and LEN_FAIL_SKIP_PENALTY:
+        return max(min(w, 1.0), W_FLOOR, LEN_FAIL_MIN_WEIGHT)
+
     m = 1.0
     if not d_len_ok:
         m *= M_LEN
@@ -324,7 +331,8 @@ class MultiOCRAdaptive:
     @torch.no_grad()
     def compute_char_weights(self, generated_images, labels,
                              ocr_logits=None, max_samples=None,
-                             phase_c=False):
+                             phase_c=False, len_apply=None,
+                             pair_sets=None, pair_from="ppll"):
         """
         计算每个生成样本每个字符位的证据权重。
 
@@ -336,14 +344,24 @@ class MultiOCRAdaptive:
                          N>0=随机 N 张走全表, 其余快速路径
             phase_c: 机器干扰阶段 — 混淆对内 NEAR 视为目标态 (映射为 HIT),
                      M_cheat 仅罚越界垃圾预测
+            len_apply: v2 扩展 (bool_d, bool_p), 是否把该 OCR 的长度错误
+                       视为结构失败; None=不启用 (保持 v28 行为).
+            pair_sets: v2 扩展 {true_char: set(wrong_chars)}; 用于返回
+                       第三方 OCR 命中"头部超额对"的 pair_mask (不改权重).
+            pair_from: ppll / dddd / both, 哪个 OCR 的预测触发 pair_mask.
 
         Returns:
             char_weights: (B, CAPTCHA_LENGTH) tensor on device
-            info: dict(w_mean, valid_ratio, n_full, n_fast)
+            info: dict(w_mean, valid_ratio, n_full, n_fast, len_fail_mask,
+                       len_fail_ratio, pair_mask, pair_ratio)
         """
         from config import OCR_VALID_THR, NUM_CLASSES
         B = generated_images.size(0)
         dev = generated_images.device
+        if len_apply is None:
+            apply_d, apply_p = False, False
+        else:
+            apply_d, apply_p = bool(len_apply[0]), bool(len_apply[1])
 
         # ── 1. C 状态 (每步都算, GPU 向量化) ──
         cap = self.ocr_models.get('captcha_resnet')
@@ -395,6 +413,8 @@ class MultiOCRAdaptive:
 
         # ── 4. 逐位查表 ──
         char_w = torch.zeros(B, CAPTCHA_LENGTH, dtype=torch.float32, device=dev)
+        len_fail_mask = torch.zeros(B, dtype=torch.bool, device=dev)
+        pair_mask = torch.zeros(B, CAPTCHA_LENGTH, dtype=torch.bool, device=dev)
         for i in range(B):
             label_str = ''.join(label_chars[i])
 
@@ -407,6 +427,9 @@ class MultiOCRAdaptive:
                                      else ([None] * CAPTCHA_LENGTH, True))
                 p_chars, p_len_ok = (align_pred(p_raw, label_str) if has_p
                                      else ([None] * CAPTCHA_LENGTH, True))
+                len_fail = bool((apply_d and has_d and not d_len_ok)
+                                or (apply_p and has_p and not p_len_ok))
+                len_fail_mask[i] = len_fail
                 consensus_wrong = (has_d and has_p and bool(d_raw)
                                    and d_raw == p_raw and d_raw != label_str)
                 # 越界垃圾预测判定 (含非 36 类字符 → M_cheat 依据)
@@ -415,6 +438,17 @@ class MultiOCRAdaptive:
                 for j in range(CAPTCHA_LENGTH):
                     lc = label_chars[i][j]
                     pc = pred_chars[i][j]
+                    # v2: 第三方 OCR 命中头部超额对 (true->wrong) 的位
+                    if pair_sets is not None:
+                        wrongs = []
+                        if pair_from in ("ppll", "both") and p_chars[j] is not None:
+                            wrongs.append(p_chars[j])
+                        if pair_from in ("dddd", "both") and d_chars[j] is not None:
+                            wrongs.append(d_chars[j])
+                        for wc in wrongs:
+                            if wc != lc and wc in pair_sets.get(lc, ()):
+                                pair_mask[i, j] = True
+                                break
                     d_state = dp_state(d_chars[j], lc, p_chars[j]) if has_d else DP_MISS
                     p_state = dp_state(p_chars[j], lc, d_chars[j]) if has_p else DP_MISS
                     # C 状态
@@ -445,7 +479,8 @@ class MultiOCRAdaptive:
                     w = apply_multipliers(
                         w, d_state, p_state, cs, float(conf[i, j]),
                         d_len_ok, p_len_ok, consensus_wrong,
-                        phase_c=phase_c, d_garbage=d_garbage, p_garbage=p_garbage)
+                        phase_c=phase_c, d_garbage=d_garbage, p_garbage=p_garbage,
+                        len_fail=len_fail)
                     char_w[i, j] = w
                     key = (C_SYMBOL[cs], DP_SYMBOL[d_state], DP_SYMBOL[p_state])
                     self.combo_counts[key] = self.combo_counts.get(key, 0) + 1
@@ -480,6 +515,10 @@ class MultiOCRAdaptive:
             "valid_ratio": valid_ratio,
             "n_full": len(full_idx),
             "n_fast": B - len(full_idx),
+            "len_fail_mask": len_fail_mask,
+            "len_fail_ratio": float(len_fail_mask.float().mean()),
+            "pair_mask": pair_mask,
+            "pair_ratio": float(pair_mask.float().mean()),
         }
         return char_w, info
 

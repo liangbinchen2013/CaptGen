@@ -1,25 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-里程碑评测 — 生成图机器混淆画像 vs 真实画像 (M1-M8)
+里程碑评测 — 生成图机器混淆画像 vs 真实画像 (M1-M9)
 
 用法:
-  python evaluate_generated.py --ckpt output_v28/checkpoint_epoch_400.pt
-  python evaluate_generated.py --ckpt ... --n 2000 --tag ep300
+  python evaluate_generated.py --ckpt output_v32/checkpoint_epoch_400.pt
+  python evaluate_generated.py --ckpt ... --n 2000 --tag ep300 --output-dir output_v32
 
 流程:
   1. 加载 EMA 生成器, 按真实标签分布采样标签
   2. 生成 N 张 → ddddocr + ppllocr + CaptchaResNet 评估
   3. 输出与 ocr_error_stats_*.txt 同格式的 gen_error_stats_*.txt
-  4. 对比 confusion_profile.json → M1-M8 报告 (console + report txt)
+  4. 对比 confusion_profile.json → M1-M9 报告 (console + report txt)
 
 验收线 (以"匹配真实机器画像"为目标):
   M1 双OCR整图acc比 ∈ [0.85, 1.05]
   M2 字符错误率比 ∈ [0.8, 1.3]
+  M3 混淆JS超额 (raw - 同错误数完美生成器下限) ≤ 0.10; raw/下限仅 INFO
   M4 <LEN>错误比 ∈ [0.5, 2.0] (与真实同量级, 既不硬切间隙也不过度粘连)
   M6 逐字符错误率MAE < 0.05
   M7 gap墨迹比贴近真实均值 ±0.15
-  M8 CaptchaResNet整图acc ≥ 0.85
-  M3 混淆分布JS散度仅作参考 (越低越接近真实画像)
+  M8 CaptchaResNet整图acc ≥ 0.85 (训练锚, 仅代理指标, 不能单独代表外部可读性)
+  M9 归一化超额混淆对 top10 和 ≤ 0.10
 """
 import argparse
 import json
@@ -33,9 +34,18 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (CHARS, NUM_CLASSES, CAPTCHA_LENGTH,
-                    LATENT_DIM, GAP_STRIPS, GAP_INK_TAU, OUTPUT_DIR)
+                    LATENT_DIM, GAP_STRIPS, GAP_INK_TAU)
 
 ROOT = Path(__file__).resolve().parent
+
+
+def split_pair_key(k: str):
+    """confusion_profile pairs 键 't>p' → (t, p); '<LEN>' 自身含 '>' 需特判"""
+    if k.startswith("<LEN>>"):
+        return "<LEN>", k[len("<LEN>>"):]
+    t, p = k.split(">", 1)
+    return t, p
+
 
 
 # ─────────────────────────── 生成 ───────────────────────────
@@ -189,7 +199,39 @@ def js_divergence(p: dict, q: dict):
     return 0.5 * _kl(P, M) + 0.5 * _kl(Q, M)
 
 
-def compare(gen_results, profile, gap):
+def m3_noise_floor(gen_results, profile, real_pairs, n_sim=200, seed=0):
+    """完美生成器 (按真实分布抽样, 各OCR错误数同生成侧) 的 M3: (均值, p95).
+
+    同一 M3 数值在不同错误数下不可直接比较: 错误越多, 随机采样越接近真实
+    分布, 下限越低. 必须报 raw - floor 的"超额".
+    """
+    rng = np.random.default_rng(seed)
+    parts = []
+    for name, g in gen_results.items():
+        real = defaultdict(float)
+        for k, c in profile["per_ocr"].get(name, {}).get("pairs", {}).items():
+            t, p = split_pair_key(k)
+            if t != "<LEN>":
+                real[(t, p)] += c
+        n_err = int(sum(c for (t, _p), c in g["pairs"].items() if t != "<LEN>"))
+        if real and n_err > 0:
+            keys = list(real)
+            prob = np.array([real[k] for k in keys], dtype=np.float64)
+            parts.append((keys, prob / prob.sum(), n_err))
+    if not parts:
+        return None
+    vals = []
+    for _ in range(n_sim):
+        sim = defaultdict(float)
+        for keys, prob, n_err in parts:
+            for k, c in zip(keys, rng.multinomial(n_err, prob)):
+                if c:
+                    sim[k] += c
+        vals.append(js_divergence(sim, real_pairs))
+    return float(np.mean(vals)), float(np.percentile(vals, 95))
+
+
+def compare(gen_results, profile, gap, char_occ=None):
     rep = []
     ok_all = True
 
@@ -210,7 +252,7 @@ def compare(gen_results, profile, gap):
         check(f"M1 {name} acc比 fake/real", ratio_acc, 0.85, 1.05)
         check(f"M2 {name} 字符错误率比", ratio_err, 0.8, 1.3)
 
-    # M3: 混淆分布 JS 散度 (双OCR合并, 去<LEN>) — 参考线, 不参与达标判定
+    # M3: 混淆分布 JS 散度 — 用"同错误数完美生成器下限"校正后判定
     gen_pairs = defaultdict(float)
     for name, g in gen_results.items():
         for (t, p), c in g["pairs"].items():
@@ -219,11 +261,18 @@ def compare(gen_results, profile, gap):
     real_pairs = defaultdict(float)
     for name in ("ddddocr", "ppllocr"):
         for k, c in profile["per_ocr"].get(name, {}).get("pairs", {}).items():
-            t, p = k.split(">", 1)     # 预测字符可含 '>' (如 7->>), 仅切首段
+            t, p = split_pair_key(k)
             if t != "<LEN>":
                 real_pairs[(t, p)] += c
     js = js_divergence(gen_pairs, real_pairs)
-    rep.append(f"  INFO M3 混淆分布JS散度: {js:.4f}  (参考线<0.1, 越低越接近真实画像)")
+    floor = m3_noise_floor(gen_results, profile, real_pairs)
+    if floor:
+        check("M3 混淆JS超额 (raw-下限)", js - floor[0], None, 0.10)
+        rep.append(f"       (raw={js:.4f}, 完美生成器下限={floor[0]:.4f}, "
+                   f"p95={floor[1]:.4f})")
+    else:
+        check("M3 混淆分布JS散度", js, None, 0.10)
+        rep.append(f"       (raw={js:.4f}; 无法计算噪声下限)")
 
     # M4: <LEN> 错误比 — 与真实数据同量级 (既避免硬切间隙, 也不过度粘连)
     for name in ("ddddocr", "ppllocr"):
@@ -254,6 +303,40 @@ def compare(gen_results, profile, gap):
     else:
         rep.append(f"  INFO M7 gap墨迹比: {gap['ratio_mean']:.4f} (缺少真实 gap 画像)")
 
+    # M9: 归一化超额混淆对 top10 和 (分母=该字符出现总数, 不按总错误数稀释)
+    if char_occ:
+        gpair = defaultdict(float)
+        rpair = defaultdict(float)
+        for g in gen_results.values():
+            for (t, p_), c in g["pairs"].items():
+                if t != "<LEN>":
+                    gpair[(t, p_)] += c
+        for name in ("ddddocr", "ppllocr"):
+            for k, c in profile["per_ocr"].get(name, {}).get("pairs", {}).items():
+                t, p_ = split_pair_key(k)
+                if t != "<LEN>":
+                    rpair[(t, p_)] += c
+        n_g = max(len(gen_results), 1)
+        n_r = max(len(profile["per_ocr"]), 1)
+        ex = []
+        for (t, p_) in set(gpair) | set(rpair):
+            gd = char_occ.get(t, 0) * n_g
+            rd = profile["label_counts"].get(t, 0) * n_r
+            gr = gpair.get((t, p_), 0) / gd if gd else 0.0
+            rr = rpair.get((t, p_), 0) / rd if rd else 0.0
+            ex.append((gr - rr, t, p_, int(gpair.get((t, p_), 0)), gr, rr))
+        ex.sort(key=lambda x: -x[0])
+        ex_top = [e for e in ex if e[3] >= 5][:10]
+        m9 = float(sum(max(0.0, e[0]) for e in ex_top))
+        ok9 = m9 <= 0.10
+        ok_all &= ok9
+        rep.append(f"  {'PASS' if ok9 else 'FAIL'} M9 归一化超额top10和: {m9:.4f}  "
+                   f"target[<=0.10] (v28基线=0.2301, n>=5)")
+        for e in ex_top[:5]:
+            if e[0] > 0:
+                rep.append(f"       {e[1]}->{e[2]}: gen {e[4]*100:.2f}% vs real "
+                           f"{e[5]*100:.2f}% (n={e[3]})")
+
     return rep, ok_all
 
 
@@ -264,6 +347,8 @@ def main():
     ap.add_argument("--tag", default="eval", help="输出文件标签")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--output-dir", default=None,
+                    help="报告/画像输出目录 (默认: ckpt 所在目录)")
     args = ap.parse_args()
 
     np.random.seed(args.seed)
@@ -290,11 +375,12 @@ def main():
     print(f"  gap墨迹比: {gap['ratio_mean']:.3f} " +
           " ".join(f"{k}={v:.2f}" for k, v in gap["ratio"].items()))
 
-    # 写同格式画像文件 (输出目录随 OUTPUT_DIR)
-    outdir = Path(OUTPUT_DIR)
-    if not outdir.is_absolute():
-        outdir = ROOT / outdir
+    # 写同格式画像文件 (v32: 默认写到 ckpt 所在目录, 不再固定 OUTPUT_DIR)
+    outdir = (Path(args.output_dir) if args.output_dir
+              else Path(args.ckpt).resolve().parent)
     outdir.mkdir(parents=True, exist_ok=True)
+    from collections import Counter as _Counter
+    char_occ = _Counter(CHARS[t] for row in labels.tolist() for t in row)
     for name, g in gen_results.items():
         p = outdir / f"gen_error_stats_{name}_{args.tag}.txt"
         with open(p, "w", encoding="utf-8") as f:
@@ -303,15 +389,19 @@ def main():
             f.write(f"整图准确率: {g['img_acc']:.6f} ({g['img_correct']}/{g['img_total']})\n")
             f.write(f"字符错误数: {g['char_err']} / {g['char_total']}   "
                     f"字符错误率: {g['char_err_rate']:.6f}\n\n")
-            f.write("真实字符->预测字符 次数 (占比)\n")
+            f.write("真实字符->预测字符 次数 (占该字符出现率 | 占总错误比)\n")
             tot = max(g["char_err"], 1)
             for (t, p_), c in sorted(g["pairs"].items(),
                                      key=lambda x: -x[1] if isinstance(x[1], int) else 0):
-                f.write(f"{t}->{p_} {c} ({c/tot*100:.2f}%)\n")
+                denom = char_occ.get(t, 0) * len(gen_results)
+                if t != "<LEN>" and denom > 0:
+                    f.write(f"{t}->{p_} {c} ({c/denom*100:.2f}% | {c/tot*100:.2f}%)\n")
+                else:
+                    f.write(f"{t}->{p_} {c} (长度错误 | {c/tot*100:.2f}%)\n")
         print(f"  [OK] {p.name}")
 
-    print("[4/4] M1-M8 对比 ...")
-    rep, ok_all = compare(gen_results, profile, gap)
+    print("[4/4] M1-M9 对比 ...")
+    rep, ok_all = compare(gen_results, profile, gap, char_occ=char_occ)
     # M6: 逐字符错误率 MAE (生成侧 vs 真实侧, 同口径双OCR合并)
     gen_err_by_true = defaultdict(float)
     for name, g in gen_results.items():
@@ -336,7 +426,7 @@ def main():
 
     # M8: 可读性
     ok8 = c_acc >= 0.85
-    rep.append(f"  {'PASS' if ok8 else 'FAIL'} M8 CaptchaResNet整图acc: {c_acc:.4f}  target[>=0.85]")
+    rep.append(f"  {'PASS' if ok8 else 'FAIL'} M8 CaptchaResNet整图acc (代理): {c_acc:.4f}  target[>=0.85]")
     rep.append(f"       (人评待做: {outdir.name} 样图 @里程碑)")
 
     report = "\n".join([
@@ -348,7 +438,7 @@ def main():
           for k, v in gen_results.items()],
         f"gap墨迹比: {gap['ratio_mean']:.3f}",
         "",
-        "M1-M8:",
+        "M1-M9:",
         *rep,
         "",
         "结论: " + ("全部达标" if ok_all and ok6 and ok8 else "部分未达标 (见 FAIL 项)"),
