@@ -1,0 +1,5 @@
+__pycache__/
+output_*/
+训练数据/
+*.pt
+*.pth

@@ -1,16 +1,16 @@
 """
-设备工具：自动检测 NPU/CUDA/CPU，提供统一接口
-支持: 华为昇腾NPU (torch_npu) / NVIDIA GPU (CUDA) / CPU
+设备工具: 自动检测 NPU/CUDA/CPU, 提供统一接口
+
+支持: 华为昇腾 NPU (torch_npu) / NVIDIA GPU (CUDA) / CPU
 
 用法:
-  from device_utils import device, device_type, DEVICE, autocast, get_scaler, synchronize
+  from device_utils import DEVICE, device_type, autocast, get_scaler, synchronize
   model.to(DEVICE)
   pin_memory = device_supports_pin_memory()
 """
 import torch
 from contextlib import nullcontext
 
-# ─── 尝试导入 torch_npu ─────────────────────────────────
 try:
     import torch_npu
     _HAS_NPU = True
@@ -19,17 +19,15 @@ except ImportError:
     _HAS_NPU = False
 
 
-# ─── 设备检测 ────────────────────────────────────────────
 def get_device():
     """自动检测可用设备: NPU > CUDA > CPU"""
     if _HAS_NPU and torch_npu.npu.is_available():
         d = torch.device("npu:0")
         # 禁用 NPU 内部格式 (NC1HWC0 / NZ), 避免:
-        #   1. empty_like().normal_() 产生 "Cannot create tensor with
-        #      internal format while allow_internal_format=False" 警告
-        #   2. AdaptiveAvgPool2d / Flatten 等算子反向传播时维度不匹配
+        #   1. 随机初始化触发的内部格式告警
+        #   2. AdaptiveAvgPool2d / Flatten 等算子反向传播维度不匹配
         #   3. view / reshape 在非标准 strides 上静默失败
-        # 性能影响: 轻微 (标准 NCHW 格式仍可利用 AICore 加速)
+        # 性能影响轻微 (标准 NCHW 格式仍可利用 AICore 加速)。
         try:
             torch_npu.npu.config.allow_internal_format = False
             print(f"[DEVICE] NPU 内部格式已禁用 (allow_internal_format=False)")
@@ -85,24 +83,18 @@ def manual_seed_all(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_amp_device_str():
-    """AMP autocast 需要的设备字符串"""
-    return device_type  # 'npu', 'cuda', or 'cpu'
-
-
 def get_scaler():
     """
-    返回设备对应的 GradScaler (混合精度训练)
+    返回设备对应的 GradScaler (混合精度训练)。
     NPU: torch_npu.npu.amp.GradScaler()
-    CUDA: torch.amp.GradScaler('cuda')  (v4.3: init_scale=128 防止 GAN 初期溢出)
+    CUDA: torch.amp.GradScaler('cuda') — init_scale=128,
+          GAN 训练初期损失较大, 默认 scale 会导致 fp16 梯度溢出 NaN
     CPU: None
     """
     if device_type == "npu" and _HAS_NPU:
         from torch_npu.npu import amp
         return amp.GradScaler()
     elif device_type == "cuda":
-        # v4.3: GAN 训练初期 losses 大 (3-7), 默认 init_scale=65536 会导致
-        # fp16 梯度溢出 NaN。init_scale=128 启动, scaler 会自动增长到合适值。
         return torch.amp.GradScaler('cuda', init_scale=128.0)
     else:
         return None
@@ -110,36 +102,31 @@ def get_scaler():
 
 def autocast():
     """
-    返回设备对应的 autocast 上下文管理器 (混合精度训练)
-    NPU: 暂用 nullcontext (NPU AMP 导致 D/G 梯度 dtype 冲突)
-    CUDA: v4.5 禁用 AMP, 改用纯 fp32 (此模型与 AMP 二阶梯度不兼容, 反复 NaN)
-    CPU: nullcontext()
+    返回设备对应的 autocast 上下文管理器。
+    注意: 本项目的 R1/R2 二阶梯度与 AMP fp16 不兼容, 因此实际均使用
+    nullcontext (纯 fp32); 保留该接口以便后续按设备启用。
     """
     if device_type == "npu" and _HAS_NPU:
         return nullcontext()
     elif device_type == "cuda":
-        # v4.5: GAN + R1 二阶梯度与 AMP fp16 不兼容, 改用纯 fp32
         return nullcontext()
     else:
         return nullcontext()
 
 
 def use_amp():
-    """是否启用 AMP: v4.5 CUDA 也禁用, 仅 NPU 可考虑开启"""
+    """是否启用 AMP (当前版本为纯 fp32 训练)"""
     return False
 
 
 def scaler_unscale_(scaler, optimizer):
-    """
-    在梯度裁剪前 unscaling。
-    NPU 需要在 clip_grad_norm_ 之前调用 scaler.unscale_(optimizer)
-    """
+    """在梯度裁剪前执行 unscaling (GradScaler 场景)"""
     if scaler is not None:
         scaler.unscale_(optimizer)
 
 
 def setup_matmul_precision():
-    """设置矩阵乘法精度（NPU/CUDA 都启用 high 模式）"""
+    """设置矩阵乘法精度 (NPU/CUDA 启用 high 模式)"""
     if device_type in ("npu", "cuda"):
         torch.set_float32_matmul_precision('high')
         print(f"[DEVICE] float32 matmul precision 已设为 high")
@@ -165,5 +152,4 @@ def print_npu_env_hints():
 if __name__ == "__main__":
     print(f"设备: {DEVICE} (type={device_type})")
     print(f"支持 pin_memory: {device_supports_pin_memory()}")
-    print(f"AMP 设备字符串: {get_amp_device_str()}")
     print(f"Has NPU: {_HAS_NPU}")

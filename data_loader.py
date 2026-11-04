@@ -1,9 +1,10 @@
 """
-数据加载：从 batch_* 目录读取验证码图片，返回 image + label
-字符集: 0-9, A-Z (36 类)
-NPU: 预加载到 CPU 内存 (≈1.26GB) + num_workers=0 (绕过 shm 限制)
+数据加载: 从 batch_* 目录读取验证码图片, 返回 image + label
+
+- 图片: 35×90 灰度, 归一化到 tanh 空间 [-1, 1]
+- 标签: 4 字符, 映射为大写 36 类 (0-9 + A-Z)
+- NPU: 预加载到 CPU 内存 (约 1.26GB) + num_workers=0 (绕过 shm 限制)
 """
-import os
 from pathlib import Path
 
 import numpy as np
@@ -16,16 +17,14 @@ from device_utils import device_supports_pin_memory, DEVICE
 
 
 def label_to_tensor(label: str) -> torch.LongTensor:
-    """将标签 'ab12' → [idx_a, idx_b, idx_1, idx_2]
-    自动应用 LABEL_CASE_MAP 修正大小写标注错误
-    """
+    """将标签 'ab12' → [idx_a, idx_b, idx_1, idx_2], 自动应用大小写映射"""
     label = "".join(LABEL_CASE_MAP.get(c, c) for c in label)
     ids = [CHARS.index(c) for c in label]
     return torch.tensor(ids, dtype=torch.long)
 
 
 def tensor_to_label(tensor: torch.Tensor) -> str:
-    """将 [idx0, idx1, idx2, idx3] → 'ab12'"""
+    """将 [idx0, idx1, idx2, idx3] → 'AB12'"""
     ids = tensor.cpu().tolist()
     if isinstance(ids[0], (list, tuple)):
         ids = ids[0]
@@ -51,7 +50,6 @@ class CaptchaDataset(Dataset):
         self._cache = []      # 预加载缓存: [(tensor, label_tensor), ...]
         bad_count = 0
 
-        # 遍历所有 batch_* 目录
         for batch_dir in sorted(
             self.data_dir.glob("batch_*"),
             key=lambda p: int(p.name.split("_")[1])
@@ -67,7 +65,7 @@ class CaptchaDataset(Dataset):
         if bad_count:
             print(f"[WARN] 跳过 {bad_count} 张损坏图片")
 
-        # 预加载: 一次性读入内存 (NPU 90GB HBM 充足)
+        # 预加载: 一次性读入内存 (NPU 大显存场景推荐)
         if self.preload:
             print(f"[PRELOAD] 正在预加载 {len(self.files)} 张图片到内存...")
             loaded = 0
@@ -86,7 +84,6 @@ class CaptchaDataset(Dataset):
             self.files = self.files[:loaded]  # 只保留成功加载的
             if bad_count:
                 print(f"[WARN] 预加载跳过 {bad_count} 张损坏图片")
-            # 估算内存: 99K × 35×90×4B ≈ 1.26 GB
             mem_mb = sum(t[0].numel() for t in self._cache) * 4 / 1e6
             print(f"[PRELOAD] 完成: {len(self._cache)} 张, 约 {mem_mb:.0f} MB")
 
@@ -115,7 +112,7 @@ class CaptchaDataset(Dataset):
             except Exception:
                 idx = (idx + 1) % len(self.files)
 
-        # v7: 10 次重试后仍失败则抛出异常, 不再静默返回零张量污染训练
+        # 10 次重试后仍失败则抛出异常, 不静默返回零张量污染训练
         raise RuntimeError(
             f"Failed to load any valid image after 10 retries. "
             f"Last attempted: {self.files[idx] if idx < len(self.files) else 'N/A'}"
@@ -127,9 +124,9 @@ def get_dataloader(data_dir=None, preload: bool = None,
     """创建 DataLoader
 
     Args:
-        data_dir: 训练数据路径，默认使用 config.DATA_DIR
-        preload:  是否预加载到内存。None 则 NPU→True (绕过 shm), GPU/CPU→False
-        batch_size: 批大小。None 则用 config.BATCH_SIZE (v27: 修复 --batch-size 被忽略)
+        data_dir:   训练数据路径, 默认使用 config.DATA_DIR
+        preload:    是否预加载到内存。None 则 NPU→True (绕过 shm), GPU/CPU→False
+        batch_size: 批大小。None 则用 config.BATCH_SIZE
     """
     if data_dir is None:
         data_dir = DATA_DIR
@@ -137,14 +134,11 @@ def get_dataloader(data_dir=None, preload: bool = None,
         batch_size = BATCH_SIZE
 
     # NPU: 预加载到 CPU 内存 + num_workers=0, 绕过 /dev/shm 64MB 限制
-    # 99K 张 35×90 灰度图 → ≈1.26GB CPU RAM, 远小于 NPU 90GB HBM
     if preload is None:
         preload = (str(DEVICE).startswith("npu"))
 
     dataset = CaptchaDataset(data_dir, preload=preload)
 
-    # num_workers=0: 主进程直接取预加载数据, 无需 IPC/shared memory
-    # pin_memory=True: 主进程锁页 → NPU DMA 传输 (不经过 shm)
     dl_kwargs = dict(
         batch_size=batch_size,
         shuffle=True,

@@ -1,22 +1,31 @@
 """
-训练 AC-GAN + Hinge Loss + R1+R2 + ADA 条件验证码生成器
-v10: 架构重写 + 损失均衡 — Generator渐进式生成 + Edge/Realism损失
-v12: 多样性修复 — 同标签双z对比损失 + D步日志快照
-v28: gap 损失改上限 hinge 且默认关闭 + 断点续训恢复 scheduler + 日志区分未测量
+验证码生成器训练入口
+
+模型: AC-GAN (条件生成器 + 判别器 + 逐位辅助分类), Hinge 对抗损失,
+      R1/R2 梯度惩罚, StyleGAN2-ADA 自适应判别器增强, EMA 权重平滑。
+
+训练阶段
+  1. D 预训练        判别器先学会区分真假, 建立基础判别力
+  2. G 预热          生成器仅用辅助分类/边缘/分布等损失学习字形
+  3. 渐进对抗        对抗权重线性爬升, 联合优化 G 与 D
+  4. OCR 课程学习    前期以 CaptchaResNet 强引导字形, 后期三 OCR 防欺骗
+  5. Phase C         以真实机器混淆画像软化监督目标 (机器干扰匹配)
 
 用法:
-  python train.py                                         # 使用默认配置
-  python train.py --data-dir ./训练数据                     # 指定数据路径
-  python train.py --output-dir ./output                    # 指定输出路径
-  python train.py --resume ./output/checkpoint_epoch_100.pt # 断点续训
-  python train.py --epochs 300 --batch-size 256            # 自定义训练参数
+  python train.py                                            # 使用默认配置
+  python train.py --data-dir ./训练数据                       # 指定数据路径
+  python train.py --output-dir ./output                      # 指定输出路径
+  python train.py --resume ./output/checkpoint_epoch_100.pt  # 断点续训
+  python train.py --epochs 300 --batch-size 256              # 自定义训练参数
 """
-import os
 import time
 import argparse
+import random
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,57 +39,75 @@ from models import (
 )
 import ocr_net
 
-# v25: 双向对比度匹配参数 (来自config.py)
 _CONTRAST_MARGIN = CONTRAST_MARGIN
 _CONTRAST_LO_Q = CONTRAST_LO_Q
 _CONTRAST_HI_Q = CONTRAST_HI_Q
 _D_UPDATES_MAX = D_UPDATES_MAX
 _D_ADAPTIVE_THRESHOLD = D_ADAPTIVE_THRESHOLD
 from data_loader import get_dataloader
-from utils import save_sample, save_model, load_model
+from utils import save_sample, load_model
 from device_utils import (
     DEVICE, device_type, device_supports_pin_memory,
-    get_amp_device_str, empty_cache, setup_matmul_precision,
-    get_scaler, autocast, scaler_unscale_, synchronize, use_amp,
-    print_npu_env_hints,
+    empty_cache, setup_matmul_precision,
+    get_scaler, autocast, scaler_unscale_, use_amp,
+    print_npu_env_hints, manual_seed_all,
 )
 
-
-# ═══════════════════════════════════════════════════════════
-#  设备自适应配置 (config.py 已自动检测 NPU/GPU)
-# ═══════════════════════════════════════════════════════════
-
 # ─── 日志配置 ────────────────────────────────────────────
-_CONSOLE_LOG_INTERVAL = 20   # 控制台输出间隔 (步数)
-_FILE_LOG_INTERVAL   = 100  # 文件日志间隔 (步数), 更详细
+_FILE_LOG_INTERVAL = 100   # CSV 文件日志间隔 (步数), 比控制台更详细
 
+
+def seed_everything(seed: int, deterministic: bool = False):
+    """v32: 固定随机种子, 让版本/消融对比不被初始化/数据顺序吞掉."""
+    random.seed(seed)
+    np.random.seed(seed)
+    manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"  [SEED] seed={seed} deterministic={deterministic}")
+
+
+def sample_real_labels(n: int, device):
+    """v32: 按真实标签分布采样固定样例标签 (排除训练集从未出现的 '0').
+
+    v28 用 torch.randint(0, 36) 生成固定样例, 16 个标签里约 6 个含 '0';
+    '0' 在 149,888 张训练图中出现 0 次, 这些位置是纯噪声, 会误导人评.
+    """
+    try:
+        import json
+        p = Path(__file__).parent / "confusion_profile.json"
+        counts = json.loads(p.read_text(encoding="utf-8")).get("label_counts", {})
+        chars = [c for c in CHARS if counts.get(c, 0) > 0]
+        if chars:
+            w = torch.tensor([counts[c] for c in chars], dtype=torch.float32)
+            w = w / w.sum()
+            idx = torch.multinomial(w, n * CAPTCHA_LENGTH, replacement=True)
+            idx = idx.view(n, CAPTCHA_LENGTH)
+            char_ids = torch.tensor([CHARS.index(c) for c in chars], dtype=torch.long)
+            return char_ids[idx].to(device)
+    except Exception as e:
+        print(f"  [WARN] 真实标签分布采样失败, 回退排除 '0': {e}")
+    return torch.randint(1, NUM_CLASSES, (n, CAPTCHA_LENGTH), device=device)
 
 
 # ═══════════════════════════════════════════════════════════
-#  Hinge Loss (v3: 全设备统一, 替代 WGAN-GP)
+#  Hinge Loss (全设备统一, 替代 WGAN-GP)
 # ═══════════════════════════════════════════════════════════
-# WGAN-GP 不约束 D 的绝对值范围, 训练中 score 可在 ±4 漂移,
-# 导致 G 梯度退化为常数信号, 被迫输出空白图。
-# Hinge Loss 天然迫使 D 在 [-1, 1] 区间工作, 配合 SpectralNorm
-# 约束 Lipschitz, 无需额外梯度惩罚 (参考 SNGAN + Hinge, Miyato 2018)
-#
-# Hinge 下 D_UPDATES=1 即可稳定训练, CUDA 设 2 增加 D 判别力
+# WGAN-GP 不约束 D 的绝对值范围, 训练中 score 可漂移, 导致 G 梯度退化;
+# Hinge Loss 迫使 D 在 [-1, 1] 区间工作, 配合 SpectralNorm 约束 Lipschitz,
+# 无需额外梯度惩罚 (参考 SNGAN + Hinge, Miyato 2018), D_UPDATES=1 即可稳定。
 
-_USE_HINGE_LOSS = True  # 全设备统一使用 Hinge Loss
-
-# D per G step 更新次数
-# v5: CUDA 恢复 D_UPDATES=2, NPU 保持 1 (已在 config NPU 覆盖中设置)
 _D_UPDATES_HINGE = D_UPDATES
 
-# v11: 自适应D更新次数 — 当D判别能力下降时自动增加训练频率
+
 def get_adaptive_d_updates(d_real_ema_val: float, d_fake_ema_val: float) -> int:
     """
-    根据D的判别Gap动态调整D更新次数:
-      - Gap > 1.0: D健康, 基础1次更新
-      - Gap 0.3-1.0: D偏弱, 增加到2次
-      - Gap < 0.3: D严重落后, 增加到3次 (MAX)
-
-    这防止D被G碾压后无法恢复 (v10 epoch 300的崩溃场景).
+    根据判别间隙动态调整 D 更新次数:
+      - Gap > 1.0:        D 健康, 基础 1 次更新
+      - Gap 0.3-1.0:      D 偏弱, 增加到 2 次
+      - Gap < 0.3:        D 严重落后, 增加到 3 次 (上限)
+    防止 D 被 G 碾压后无法恢复。
     """
     gap = d_real_ema_val - d_fake_ema_val
     if gap > 1.0:
@@ -90,18 +117,16 @@ def get_adaptive_d_updates(d_real_ema_val: float, d_fake_ema_val: float) -> int:
     else:
         return _D_UPDATES_MAX  # 3
 
-print(f"  [LOSS] Hinge Loss + R1+R2 梯度惩罚 + ADA增强 (v8), D 每步更新 {_D_UPDATES_HINGE} 次")
+print(f"  [LOSS] Hinge Loss + R1+R2 梯度惩罚 + ADA增强, D 每步更新 {_D_UPDATES_HINGE} 次")
 
 
 # ═══════════════════════════════════════════════════════════
-#  ADA (Adaptive Discriminator Augmentation) — v8
+#  ADA (自适应判别器增强, 参考 StyleGAN2-ADA)
 # ═══════════════════════════════════════════════════════════
-# 参考: StyleGAN2-ADA (Karras et al., NeurIPS 2020)
-# 对 D 输入应用随机增强, 防止 D 过拟合有限训练数据 (99,889张)。
+# 对 D 输入应用随机增强, 防止 D 过拟合有限训练数据。
 # 增强概率 p 自适应调整: D 过拟合 → p↑, D 欠拟合 → p↓。
-#
 # 验证码安全增强 (排除水平翻转, 避免改变字符顺序):
-#   - 平移 (≤2px), 缩放 (0.95-1.05), 亮度/对比度, 高斯噪声, Cutout
+# 平移 (≤2px) / 缩放 (0.95-1.05) / 亮度对比度 / 高斯噪声 / Cutout。
 # 注意: 增强仅应用于 D 输入, G 始终看到干净图像。
 
 
@@ -111,19 +136,17 @@ class ADAAugment:
     def __init__(self, target: float = 0.6, p_inc: float = 2e-4,
                  p_dec: float = 5e-5, adjust_interval: int = 4):
         self.p = 0.0                     # 当前增强概率
-        self.target = target             # D 对真实数据正确率目标 (默认 0.6)
+        self.target = target             # D 对真实数据正确率目标
         self.p_inc = p_inc               # 概率增量
         self.p_dec = p_dec               # 概率减量
         self.adjust_interval = adjust_interval
         self._step = 0
-        # 累积 D 对真实数据的输出 sign (正=正确分类)
-        self._accum_real_sign = 0.0
+        self._accum_real_sign = 0.0      # 累积 D 对真实数据的输出符号
         self._accum_count = 0
 
     def update_p(self, d_real_mean: float) -> float:
         """每 adjust_interval 步更新 p, 返回当前 p"""
-        # d_real_mean: D 对真实数据的平均输出 (Hinge: >0 表示正确分类)
-        # 正确率过高 → D 过拟合 → 增大 p
+        # d_real_mean > 0 表示 Hinge 下分类正确
         self._accum_real_sign += float(d_real_mean > 0)
         self._accum_count += 1
         self._step += 1
@@ -142,14 +165,11 @@ class ADAAugment:
     @staticmethod
     def augment(images: "torch.Tensor", p: float) -> "torch.Tensor":
         """
-        对 D 输入 batch 应用随机增强 (验证码安全集合, 排除水平翻转)。
-        images: (B, 1, H, W) in tanh [-1, 1]
-        返回: 增强后的 images, 同 shape 同 range
+        对 D 输入 batch 应用随机增强 (验证码安全集合)。
+        images: (B, 1, H, W) in tanh [-1, 1], 返回同 shape 同 range。
         """
         import random as _random
-        B = images.size(0)
         device = images.device
-        dtype = images.dtype
         aug = images.clone()
 
         # 1. 平移 (≤2px, 不改变字符顺序)
@@ -163,7 +183,7 @@ class ADAAugment:
         if _random.random() < p * 0.5:
             scale = 0.95 + _random.random() * 0.1  # [0.95, 1.05]
             aug = F.interpolate(aug, scale_factor=scale, mode='bilinear',
-                              align_corners=False)
+                                align_corners=False)
             # 裁剪/填充回原始尺寸
             H, W = aug.shape[2], aug.shape[3]
             if H > images.shape[2]:
@@ -199,125 +219,77 @@ class ADAAugment:
             cut_w = max(3, int(W_img * 0.15 * _random.random()))  # 0-15% width
             cut_y = _random.randint(0, H_img - cut_h)
             cut_x = _random.randint(0, W_img - cut_w)
-            aug[:, :, cut_y:cut_y + cut_h, cut_x:cut_x + cut_w] = -1.0  # black
+            aug[:, :, cut_y:cut_y + cut_h, cut_x:cut_x + cut_w] = -1.0
 
         return aug
 
 
 # ═══════════════════════════════════════════════════════════
-#  对抗损失权重调度 (v8: 上限改为 ADV_LAMBDA_MAX=0.3)
+#  对抗损失权重调度
 # ═══════════════════════════════════════════════════════════
 
 def get_adv_lambda(epoch: int, warmup_epochs: int) -> float:
     """
-    v8: 对抗损失权重上限改为 ADV_LAMBDA_MAX (0.3), 对抗仅作微调。
-
-    权重调度:
-      1 — warmup_epochs:              0.0 (纯 Aux 训练)
+    对抗损失权重调度:
+      G 预热期:                        0.0 (纯辅助损失)
       warmup_epochs+1 — +ADV_WARMUP:  线性增长
-      >warmup_epochs+ADV_WARMUP:      ADV_LAMBDA_MAX (0.3, 非1.0)
-
-    v7分析: 对抗权重=1.0时G从未恢复到预热期质量(G=0.39 vs 1.29),
-            Aux从0.26升到0.35, 说明对抗信号压倒Aux。降到0.3让Aux主导。
+      > warmup_epochs+ADV_WARMUP:      ADV_LAMBDA_MAX
+    对抗仅作微调, 防止压倒辅助与视觉质量信号。
     """
     adv_warmup_epochs = ADV_WARMUP_EPOCHS
     if epoch <= warmup_epochs:
         return 0.0
     elif epoch <= warmup_epochs + adv_warmup_epochs:
         raw = (epoch - warmup_epochs) / adv_warmup_epochs
-        return raw * ADV_LAMBDA_MAX  # v8: 上限从1.0→ADV_LAMBDA_MAX(0.3)
+        return raw * ADV_LAMBDA_MAX
     else:
-        return float(ADV_LAMBDA_MAX)  # v8: 返回配置的对抗权重上限
+        return float(ADV_LAMBDA_MAX)
 
 
 def get_r1_lambda(global_step: int) -> float:
-    """
-    R1 权重在训练初期从 0 线性增长到 LAMBDA_R1:
-      前 5000 步逐步增加, 避免初始化时 R1 过大导致 NaN
-    v7: warmup 2000→5000, 配合更长预热期; LAMBDA_R1 0.1→0.5
-    """
-    r1_warmup_steps = 5000  # v7: 2000→5000
+    """R1 权重在训练前 5000 步从 0 线性增长, 避免初期惩罚过大导致 NaN"""
+    r1_warmup_steps = 5000
     if global_step >= r1_warmup_steps:
         return float(LAMBDA_R1)
-    else:
-        return float(LAMBDA_R1) * (global_step / r1_warmup_steps)
+    return float(LAMBDA_R1) * (global_step / r1_warmup_steps)
 
 
 def get_r2_lambda(global_step: int) -> float:
-    """
-    v7: R2 权重与 R1 对称增长, 前 5000 步线性增长到 LAMBDA_R2。
-    R1+R2 需同步引入以维持梯度平衡 (R3GAN, NeurIPS 2024)
-    """
+    """R2 权重与 R1 对称增长 (R1+R2 需同步引入以维持梯度平衡)"""
     r2_warmup_steps = 5000
     if global_step >= r2_warmup_steps:
         return float(LAMBDA_R2)
-    else:
-        return float(LAMBDA_R2) * (global_step / r2_warmup_steps)
-
-def get_fm_lambda(epoch: int, total_epochs: int) -> float:
-    """
-    v8: FM 权重从 LAMBDA_FM (0.5) 衰减到 0.15 (配合低对抗上限):
-      epoch 0-50%:   LAMBDA_FM (全量)
-      epoch 50%-80%: 线性衰减
-      epoch 80%+:    0.15 (v8: min 0.25→0.15, 配合adversarial上限0.3)
-    """
-    decay_start = int(total_epochs * 0.5)
-    decay_end   = int(total_epochs * 0.8)
-    fm_min = 0.15  # v8: 0.25→0.15, 配合ADV_LAMBDA_MAX=0.3
-    if epoch <= decay_start:
-        return float(LAMBDA_FM)
-    elif epoch >= decay_end:
-        return fm_min
-    else:
-        ratio = (epoch - decay_start) / max(decay_end - decay_start, 1)
-        return LAMBDA_FM * (1.0 - ratio) + fm_min * ratio
+    return float(LAMBDA_R2) * (global_step / r2_warmup_steps)
 
 
 def compute_aux_accuracy(aux_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """
-    v6: 返回 0-dim tensor (不 sync), 由调用方在 epoch 结束时 .item()
-    aux_logits: (B, CAPTCHA_LENGTH, NUM_CLASSES)
-    labels:     (B, CAPTCHA_LENGTH)
-    返回: 逐字符准确率 (0-dim tensor on device)
+    逐字符准确率 (0-dim tensor, 不触发设备同步)。
+    aux_logits: (B, CAPTCHA_LENGTH, NUM_CLASSES); labels: (B, CAPTCHA_LENGTH)
     """
-    preds = aux_logits.argmax(dim=-1)  # (B, CAPTCHA_LENGTH)
-    correct = (preds == labels).float().mean()  # v6: 去掉 .item(), 消除 per-step sync
-    return correct
+    preds = aux_logits.argmax(dim=-1)
+    return (preds == labels).float().mean()
 
 
 def compute_perfect_accuracy(aux_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """
-    v17: 整串正确率 — 4个字符全部正确才算对
-    aux_logits: (B, CAPTCHA_LENGTH, NUM_CLASSES)
-    labels:     (B, CAPTCHA_LENGTH)
-    返回: 整串正确率 (0-dim tensor on device)
-    """
-    preds = aux_logits.argmax(dim=-1)  # (B, CAPTCHA_LENGTH)
-    perfect = (preds == labels).all(dim=1).float().mean()  # 4个字符全部正确
-    return perfect
+    """整串正确率: 4 个字符全部正确才算对 (0-dim tensor)"""
+    preds = aux_logits.argmax(dim=-1)
+    return (preds == labels).all(dim=1).float().mean()
 
 
 def diversity_loss(fake_imgs: torch.Tensor, fake_imgs2: torch.Tensor,
                    threshold: float = 0.4) -> torch.Tensor:
     """
-    v12: 同标签双z对比多样性损失 — 直接监督 z 的使用 (根治 z 被忽略).
+    同标签双噪声对比多样性损失 — 直接监督噪声路径的使用。
 
-    v11 按字符位分组方案 (v7引入) 有致命缺陷:
-      在 batch 内按"同位置同字符"分组时, 这些样本的其余 3 个字符必然不同,
-      图像天然差异巨大, loss 恒≈0.005 — 从未真正监督"同标签不同z"的多样性.
-      结果: G 从 epoch~50 起学会忽略 z (z输入梯度仅text的1/200),
-            变成 label→图像的确定性函数, 同标签不同z像素差 0.0007/255.
-
-    v12 方案: 对同一批 labels 用 z1/z2 各生成一张, 计算两图的
-    per-pixel L1 距离, 低于阈值(0.4, tanh空间)则惩罚.
-    直接给 z 路径梯度压力: 要想损失为0, z 必须真实影响输出.
+    对同一批标签用 z1/z2 各生成一张, 计算两图 per-pixel L1 距离,
+    低于阈值则惩罚: 要想损失为 0, 噪声必须真实影响输出。
+    避免生成器退化为"标签→图像"的确定性函数 (同标签采样趋同)。
 
     Args:
         fake_imgs:  G(z1, labels), tanh [-1,1]
         fake_imgs2: G(z2, labels), 同一批 labels, tanh [-1,1]
         threshold:  目标最小 per-pixel L1 距离 (tanh 空间)
-    Returns:
-        scalar diversity loss (0-dim tensor)
     """
     dist = (fake_imgs - fake_imgs2).abs().mean(dim=(1, 2, 3))  # (B,)
     return F.relu(threshold - dist).mean()
@@ -325,38 +297,26 @@ def diversity_loss(fake_imgs: torch.Tensor, fake_imgs2: torch.Tensor,
 
 def edge_loss(fake_imgs: torch.Tensor, real_imgs: torch.Tensor) -> torch.Tensor:
     """
-    v10: Sobel边缘L1匹配 — 直接约束G生成锐利字符笔画.
-    替代v9失效的sharpness_loss (Laplacian峰度对灰度验证码无效).
+    Sobel 边缘 L1 匹配 — 直接约束生成锐利字符笔画。
 
-    对fake和real分别提取Sobel边缘幅度, 匹配两者的:
-    1. 边缘均值 (fake应该和real有相似的平均边缘强度)
+    对 fake 和 real 分别提取 Sobel 边缘幅度, 匹配两者的:
+    1. 边缘均值 (平均边缘强度)
     2. 边缘稀疏度 (锐利边缘=少数大值, 模糊边缘=均匀小值)
-
-    Args:
-        fake_imgs: (B, 1, H, W) in tanh [-1, 1]
-        real_imgs: (B, 1, H, W) in tanh [-1, 1]
-    Returns:
-        scalar edge loss
     """
-    # Sobel kernels
     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                            dtype=fake_imgs.dtype, device=fake_imgs.device).view(1, 1, 3, 3)
     sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
                            dtype=fake_imgs.dtype, device=fake_imgs.device).view(1, 1, 3, 3)
 
-    # Edge magnitude = sqrt(gx^2 + gy^2)
     gx_f = F.conv2d(fake_imgs, sobel_x, padding=1)
     gy_f = F.conv2d(fake_imgs, sobel_y, padding=1)
-    edge_f = torch.sqrt(gx_f ** 2 + gy_f ** 2 + 1e-8)  # (B, 1, H, W)
+    edge_f = torch.sqrt(gx_f ** 2 + gy_f ** 2 + 1e-8)
 
     gx_r = F.conv2d(real_imgs, sobel_x, padding=1)
     gy_r = F.conv2d(real_imgs, sobel_y, padding=1)
     edge_r = torch.sqrt(gx_r ** 2 + gy_r ** 2 + 1e-8)
 
-    # 1. Mean edge magnitude matching
     edge_mean_loss = F.l1_loss(edge_f.mean(), edge_r.mean())
-
-    # 2. Edge sparsity: ratio of pixels with edge > 0.05 (meaningful edge in tanh)
     fake_edge_ratio = (edge_f > 0.05).float().mean()
     real_edge_ratio = (edge_r > 0.05).float().mean()
     edge_sparsity_loss = F.l1_loss(fake_edge_ratio, real_edge_ratio)
@@ -366,37 +326,27 @@ def edge_loss(fake_imgs: torch.Tensor, real_imgs: torch.Tensor) -> torch.Tensor:
 
 def realism_loss(fake_imgs: torch.Tensor, real_imgs: torch.Tensor) -> torch.Tensor:
     """
-    v10: 分布统计量匹配 — 批量级别约束fake匹真实验码的视觉统计特性.
-    不需要配对数据, 在batch维度匹配分布参数.
+    分布统计量匹配 — 批量级约束生成图逼近真实数据的视觉统计特性。
 
-    匹配三个通道:
-    1. 像素均值 (per-image, 匹配亮度分布)
-    2. 像素标准差 (per-image, 匹配对比度分布)
-    3. 梯度幅度均值 (per-image, 匹配纹理复杂度)
-
-    Args:
-        fake_imgs: (B, 1, H, W) in tanh [-1, 1]
-        real_imgs: (B, 1, H, W) in tanh [-1, 1]
-    Returns:
-        scalar realism loss
+    匹配三个维度:
+    1. 逐图像素均值 (亮度分布)
+    2. 逐图像素标准差 (对比度分布)
+    3. 逐图梯度幅度 (纹理复杂度)
     """
     B = fake_imgs.size(0)
     fake_flat = fake_imgs.view(B, -1)
     real_flat = real_imgs.view(B, -1)
 
-    # 1. Per-image pixel mean distribution
-    fake_mean = fake_flat.mean(dim=1)  # (B,)
+    fake_mean = fake_flat.mean(dim=1)
     real_mean = real_flat.mean(dim=1)
     mean_loss = F.l1_loss(fake_mean.mean(), real_mean.mean()) + \
                 F.l1_loss(fake_mean.std(), real_mean.std())
 
-    # 2. Per-image pixel std distribution
     fake_std = fake_flat.std(dim=1)
     real_std = real_flat.std(dim=1)
     std_loss = F.l1_loss(fake_std.mean(), real_std.mean()) + \
                F.l1_loss(fake_std.std(), real_std.std())
 
-    # 3. Gradient magnitude per-image (texture complexity)
     dy_f = fake_imgs[:, :, 1:, :] - fake_imgs[:, :, :-1, :]
     dx_f = fake_imgs[:, :, :, 1:] - fake_imgs[:, :, :, :-1]
     grad_f = torch.cat([dy_f.abs().mean(dim=(1, 2, 3)),
@@ -413,27 +363,18 @@ def realism_loss(fake_imgs: torch.Tensor, real_imgs: torch.Tensor) -> torch.Tens
 
 
 # ═══════════════════════════════════════════════════════════
-#  v27: 反粘连 gap 墨迹损失 + Phase C 混淆软目标
+#  反粘连 gap 墨迹损失 + Phase C 混淆软目标
 # ═══════════════════════════════════════════════════════════
 
 def gap_ink_loss(fake_imgs: torch.Tensor, target_max: float = None,
                  tau: float = None, k: float = 20.0) -> torch.Tensor:
     """
-    v28: 反粘连 gap 墨迹 hinge 损失 (修复 v27 无下界过优化).
+    反粘连 gap 墨迹 hinge 损失 (可选, 默认关闭)。
 
-    v27 教训 (实测): 旧版 mean(sigmoid(...)) 无目标无下界, Ep6 开启后 2 轮内
-    gap 比从 0.5 崩到 ~0.002 (真实 0.84/0.96/0.69, v26≈真实), 字符间切出硬间隙、
-    笔画截断, 第三方 OCR 从 54%/42% 掉到 0%/0% — 视觉/机器可读性全毁.
-    本版: 软 gap 比 = 3条列界带平均墨迹密度 / 全图列墨迹峰值;
-          仅当比值 > target_max (GAP_RATIO_MAX) 时惩罚 relu(ratio-target),
-          低于目标不再给"越分离越好"的奖励 — 不会把生成逼离真实粘连分布.
-    默认 LAMBDA_GAP=0 (回归 v26 视觉), 实验时 --lambda-gap 开启.
-
-    Args:
-        fake_imgs: (B, 1, H, W) tanh[-1, 1]
-        target_max: hinge 上限 (默认 GAP_RATIO_MAX)
-    Returns:
-        scalar hinge loss (0 = 未超限, 无梯度)
+    软 gap 比 = 3 条列界带平均墨迹密度 / 全图列墨迹峰值;
+    仅当比值 > target_max 时惩罚 relu(ratio-target), 低处不奖励 —
+    避免把生成逼离真实数据的轻微粘连分布 (无下界最小化会切出硬间隙、截断笔画)。
+    默认 LAMBDA_GAP=0, 实验时用 --lambda-gap 开启。
     """
     if target_max is None:
         target_max = GAP_RATIO_MAX
@@ -441,9 +382,9 @@ def gap_ink_loss(fake_imgs: torch.Tensor, target_max: float = None,
         tau = GAP_INK_TAU
     g = (fake_imgs + 1.0) * 0.5                              # tanh→[0,1] 灰度
     B = g.size(0)
-    bg = g.view(B, -1).median(dim=1).values.detach()         # (B,) 每图背景
-    # 软墨迹 = softplus(k·(|g-bg|-tau))/k ≈ relu (非饱和, 厚墨迹也有梯度);
-    # 并扣除背景地板, 否则空白图 peak≈floor 会使 ratio=1 的退化值
+    bg = g.view(B, -1).median(dim=1).values.detach()         # 每图背景
+    # 软墨迹 = softplus(k·(|g-bg|-tau))/k ≈ relu, 厚墨迹也有梯度;
+    # 并扣除背景地板, 避免空白图 peak≈floor 造成 ratio=1 的退化值
     z = (g - bg.view(B, 1, 1, 1)).abs() - tau
     ink0 = F.softplus(torch.tensor(-k * tau, dtype=g.dtype, device=g.device)) / k
     ink = (F.softplus(k * z) / k - ink0).clamp(min=0)
@@ -456,8 +397,8 @@ def gap_ink_loss(fake_imgs: torch.Tensor, target_max: float = None,
 
 def gap_ink_ratio(fake_imgs: torch.Tensor, tau: float = None) -> float:
     """
-    v27: gap 墨迹比 (M7 指标, 与 confusion_profile.json real_gap 同口径硬判定).
-    = 3条列界带平均墨迹密度 / 全图列墨迹峰值。真实≈0.84/0.96/0.69, 目标<0.5。
+    gap 墨迹比 (日志指标, 与 confusion_profile.json 的 real_gap 同口径硬判定)。
+    = 3 条列界带平均墨迹密度 / 全图列墨迹峰值。真实 ≈ 0.84/0.96/0.69。
     """
     if tau is None:
         tau = GAP_INK_TAU
@@ -465,18 +406,34 @@ def gap_ink_ratio(fake_imgs: torch.Tensor, tau: float = None) -> float:
     B = g.size(0)
     bg = g.view(B, -1).median(dim=1).values.view(B, 1, 1, 1)
     ink = ((g - bg).abs() > tau * 255.0).float()             # 硬判定
-    prof = ink.mean(dim=(0, 1, 2))                           # (W,) 列墨迹剖面
+    prof = ink.mean(dim=(0, 1, 2))
     peak = prof.max().clamp(min=1e-6)
     ratio = torch.stack([prof[x0:x1].mean()
                          for x0, x1 in GAP_STRIPS]).mean() / peak
     return float(ratio)
 
 
-# ── Phase C 混淆软目标 (来自 confusion_profile.json) ──
+def column_ink_profile(imgs: torch.Tensor, tau: float = None,
+                       k: float = 20.0) -> torch.Tensor:
+    """v32: 可导的列墨迹剖面 (W,), 用于每步的反粘连分布匹配.
+
+    软阈值 sigmoid(((g-bg).abs()-tau)*k) 保留梯度; 真实侧 detach.
+    实测列剖面 L1: v28 0.0099, v31.1 0.0150 (+51%), 比 gap 三带更细.
+    """
+    if tau is None:
+        tau = GAP_INK_TAU
+    g = (imgs + 1.0) * 0.5
+    B = g.size(0)
+    bg = g.view(B, -1).median(dim=1).values.detach().view(B, 1, 1, 1)
+    ink = torch.sigmoid(((g - bg).abs() - tau) * k)
+    return ink.mean(dim=(0, 1, 2))
+
+
 def build_soft_targets():
     """
-    y_soft[c] = (1-ε_c)·δ_c + ε_c·confusion_dist[c],  ε_c = min(error_rate[c], EPS_CAP)
-    Returns: dist_mat (36,36), eps (36,) — 缺失行 ε=0 退化为硬 CE
+    构造 Phase C 混淆软目标:
+        y_soft[c] = (1-ε_c)·δ_c + ε_c·confusion_dist[c], ε_c = min(error_rate[c], EPS_CAP)
+    Returns: dist_mat (36,36), eps (36,) — 缺失行 ε=0 退化为硬 CE。
     """
     dist_mat = torch.zeros(NUM_CLASSES, NUM_CLASSES)
     for ch, row in CONFUSION_DIST.items():
@@ -497,9 +454,9 @@ def soft_ce(ocr_logits: torch.Tensor, labels: torch.Tensor,
             dist_mat: torch.Tensor, eps_vec: torch.Tensor,
             t: float) -> torch.Tensor:
     """
-    v27 Phase C: 混淆软目标 CE. t=0 ≡ 硬 CE (连续过渡),
-    t=1 → 目标=真实机器混淆画像 (机器干扰)。
-    Returns: (B, CAPTCHA_LENGTH) 逐字符 CE
+    Phase C 混淆软目标 CE。t=0 ≡ 硬 CE (连续过渡),
+    t=1 → 目标为真实机器混淆画像。
+    Returns: (B, CAPTCHA_LENGTH) 逐字符 CE。
     """
     B, L, C = ocr_logits.shape
     logp = F.log_softmax(ocr_logits.reshape(-1, C), dim=-1)   # (B*L, C)
@@ -510,25 +467,18 @@ def soft_ce(ocr_logits: torch.Tensor, labels: torch.Tensor,
     return -(y * logp).sum(-1).view(B, L)
 
 
-# v27: Phase C 混淆软目标 (confusion_profile.json, 双OCR全量画像)
 _SOFT_DIST, _SOFT_EPS = build_soft_targets()
 
 
 # ═══════════════════════════════════════════════════════════
+#  梯度惩罚 (R1 / R2)
+# ═══════════════════════════════════════════════════════════
 
 def compute_r1_penalty(real_pred, real_img):
     """
-    R1 梯度惩罚: E[||∇_x D(x)||²] 仅在真实数据上。
+    R1 梯度惩罚: E[||∇_x D(x)||²], 仅在真实数据上。
     强制 D 在真实数据周围保持平滑, 防止 Hinge margin 过冲。
-
-    参考: Mescheder et al. 2018 "Which Training Methods for GANs
-          do actually Converge?" (StyleGAN 标配)
-
-    Args:
-        real_pred: D 对真实图像的 logits, shape (B, 1)
-        real_img:  真实图像, shape (B, C, H, W), requires_grad=True
-    Returns:
-        scalar penalty
+    参考: Mescheder et al. 2018, StyleGAN 标配。
     """
     grad_real = autograd.grad(
         outputs=real_pred.sum(),
@@ -536,27 +486,15 @@ def compute_r1_penalty(real_pred, real_img):
         create_graph=True,
         only_inputs=True,
     )[0]
-    # ||∇_x D(x)||² 的均值
-    r1 = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
-    return r1
+    return grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
 
 
 def compute_r2_penalty(fake_pred, fake_img):
     """
-    v7: R2 梯度惩罚 — E[||∇_x D(x_fake)||²] 仅在假数据上。
-
-    与 R1 对称: R1 惩罚 D 在真实数据上的梯度, R2 惩罚 D 在假数据上的梯度。
-    R1+R2 联合强制 D 成为最大间隔分类器, 梯度范数在真假数据上平衡,
-    防止 D 过拟合到真实数据而忽略假数据。
-
-    参考: R3GAN (Huang et al., NeurIPS 2024) —
-          "R1+R2 together admit local convergence guarantees"
-
-    Args:
-        fake_pred: D 对假图像的 logits, shape (B, 1)
-        fake_img:  假图像, shape (B, C, H, W), requires_grad=True
-    Returns:
-        scalar penalty
+    R2 梯度惩罚: E[||∇_x D(x_fake)||²], 仅在生成数据上。
+    与 R1 对称, R1+R2 联合强制 D 成为最大间隔分类器,
+    防止 D 过拟合真实数据而忽略生成数据。
+    参考: R3GAN (Huang et al., NeurIPS 2024)。
     """
     grad_fake = autograd.grad(
         outputs=fake_pred.sum(),
@@ -564,40 +502,28 @@ def compute_r2_penalty(fake_pred, fake_img):
         create_graph=True,
         only_inputs=True,
     )[0]
-    # ||∇_x D(x_fake)||² 的均值
-    r2 = grad_fake.pow(2).reshape(grad_fake.shape[0], -1).sum(1).mean()
-    return r2
-
-
-def compute_gradient_penalty(D, real_imgs, fake_imgs, labels):
-    """
-    [已废弃] WGAN-GP 梯度惩罚 — v3 已全设备切换到 Hinge Loss。
-    保留函数签名以避免兼容性问题, 始终返回 0。
-    """
-    return torch.tensor(0.0, device=DEVICE)
+    return grad_fake.pow(2).reshape(grad_fake.shape[0], -1).sum(1).mean()
 
 
 # ═══════════════════════════════════════════════════════════
-#  特征匹配损失 (Feature Matching Loss)
+#  特征匹配损失
 # ═══════════════════════════════════════════════════════════
 
 def feature_matching_loss(real_features, fake_features):
     """
-    G 生成的假图在 D 中间层的特征应匹配真图的特征统计量。
-    使用 L1 loss 匹配每层的均值 (moment matching 的简化版)。
-    参考: Salimans et al. 2016 "Improved Techniques for Training GANs"
+    生成图在判别器中间层的特征应匹配真图的特征统计量 (逐层 L1)。
+    参考: Salimans et al. 2016 "Improved Techniques for Training GANs"。
     """
     total = 0.0
     n = 0
     for rf, ff in zip(real_features, fake_features):
-        # rf, ff: (B, C, H, W)
         total += F.l1_loss(ff, rf.detach())
         n += 1
     return total / max(n, 1)
 
 
 # ═══════════════════════════════════════════════════════════
-#  文件日志 (v4: CSV 格式, 每 100 步记录详细指标)
+#  CSV 文件日志
 # ═══════════════════════════════════════════════════════════
 
 _FILE_LOG_HEADER = (
@@ -605,8 +531,9 @@ _FILE_LOG_HEADER = (
     "d_loss,g_loss,aux_loss,fm_loss,fm_lambda,contrast_loss,div_loss,edge_loss,realism_loss,"
     "ocr_loss,ocr_ce,ocr_feat,ocr_lambda,ocr_w_mean,ocr_valid_ratio,ocr_acc,"
     "dddd_acc,ppll_acc,gap_ink,"
+    "dddd_len_err,ppll_len_err,len_fail_ratio,aux_gap,ada_p,struct_ce,spatial_loss,column_loss,"
     "ocr_phase,ocr_ramp,"
-    "r1_penalty,r2_penalty,gp,"
+    "r1_penalty,r2_penalty,"
     "d_real_mean,d_fake_mean,d_gap,d_real_ema,d_fake_ema,"
     "d_grad_norm,g_grad_norm,"
     "lr_g,lr_d,"
@@ -614,11 +541,12 @@ _FILE_LOG_HEADER = (
     "steps_per_sec,batch_size\n"
 )
 
-def _open_log_file(log_path: Path, resume: bool = False) -> object:
-    """打开日志文件, 续训则追加, 否则写入表头
 
-    v28: 续训但日志文件不存在/为空 (如从旧版本目录迁移续训) 时仍写表头,
-    防止新目录产生无表头 CSV."""
+def _open_log_file(log_path: Path, resume: bool = False) -> object:
+    """
+    打开日志文件: 续训则追加, 否则写入表头。
+    续训但日志文件不存在/为空时仍写表头, 防止新目录产生无表头 CSV。
+    """
     write_header = ((not resume) or (not log_path.exists())
                     or log_path.stat().st_size == 0)
     mode = "a" if (resume and not write_header) else "w"
@@ -633,10 +561,9 @@ def _write_log_line(f, timestamp: str, epoch: int, step: int, phase: str,
                     d_loss: float, g_loss: float, aux_loss: float,
                     fm_loss: float, fm_lambda: float, contrast_loss: float,
                     div_loss: float,
-                    edge_loss_val: float,  # v10
-                    realism_loss_val: float,  # v10
+                    edge_loss_val: float,
+                    realism_loss_val: float,
                     r1_penalty: float, r2_penalty: float,
-                    gp_val: float,
                     d_real: float, d_fake: float,
                     d_real_ema: float, d_fake_ema: float,
                     d_grad: float, g_grad: float,
@@ -650,8 +577,12 @@ def _write_log_line(f, timestamp: str, epoch: int, step: int, phase: str,
                     ocr_acc: float = 0.0,
                     dddd_acc: float = 0.0, ppll_acc: float = 0.0,
                     gap_ink: float = 0.0,
+                    dddd_len_err: float = -1.0, ppll_len_err: float = -1.0,
+                    len_fail_ratio: float = 0.0, aux_gap: float = -1.0,
+                    ada_p: float = 0.0, struct_ce: float = 0.0,
+                    spatial_loss: float = 0.0, column_loss: float = 0.0,
                     ocr_phase: str = "B", ocr_ramp: float = 1.0):
-    """写入一行 CSV 日志到文件 (v27: 新增机器干扰指标列)"""
+    """写入一行 CSV 日志"""
     line = (f"{timestamp},{epoch},{step},{phase},"
             f"{d_loss:.6f},{g_loss:.6f},{aux_loss:.6f},"
             f"{fm_loss:.6f},{fm_lambda:.4f},{contrast_loss:.6f},{div_loss:.6f},"
@@ -659,8 +590,10 @@ def _write_log_line(f, timestamp: str, epoch: int, step: int, phase: str,
             f"{ocr_loss:.6f},{ocr_ce:.6f},{ocr_feat:.6f},"
             f"{ocr_lambda:.4f},{ocr_w_mean:.4f},{ocr_valid_ratio:.4f},{ocr_acc:.4f},"
             f"{dddd_acc:.4f},{ppll_acc:.4f},{gap_ink:.4f},"
+            f"{dddd_len_err:.4f},{ppll_len_err:.4f},{len_fail_ratio:.4f},"
+            f"{aux_gap:+.4f},{ada_p:.4f},{struct_ce:.6f},{spatial_loss:.6f},{column_loss:.6f},"
             f"{ocr_phase},{ocr_ramp:.2f},"
-            f"{r1_penalty:.6f},{r2_penalty:.6f},{gp_val:.6f},"
+            f"{r1_penalty:.6f},{r2_penalty:.6f},"
             f"{d_real:+.4f},{d_fake:+.4f},{d_real - d_fake:+.4f},"
             f"{d_real_ema:+.4f},{d_fake_ema:+.4f},"
             f"{d_grad:.2f},{g_grad:.2f},"
@@ -673,10 +606,7 @@ def _write_log_line(f, timestamp: str, epoch: int, step: int, phase: str,
 
 
 # ═══════════════════════════════════════════════════════════
-
-
-# ═══════════════════════════════════════════════════════════
-#  梯度裁剪工具
+#  梯度工具
 # ═══════════════════════════════════════════════════════════
 
 def _batch_quantile(t: torch.Tensor, q: float) -> torch.Tensor:
@@ -690,9 +620,8 @@ def _batch_quantile(t: torch.Tensor, q: float) -> torch.Tensor:
 
 
 def clip_gradients(model, max_norm=1.0):
-    """裁剪模型梯度，防止梯度爆炸"""
-    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-    return total_norm
+    """裁剪模型梯度, 防止梯度爆炸"""
+    return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -701,7 +630,7 @@ def clip_gradients(model, max_norm=1.0):
 
 def train(args):
     print(f"\n{'='*60}")
-    print(f"  验证码 AC-GAN + Hinge Loss 训练 (v28 — v26核心 + gap修复)")
+    print(f"  验证码 AC-GAN + Hinge Loss 训练")
     print(f"{'='*60}")
     print(f"  设备: {DEVICE} ({device_type})")
     print(f"  数据: {args.data_dir}")
@@ -721,33 +650,38 @@ def train(args):
         print(f"  续训: {args.resume}")
     print(f"{'='*60}\n")
 
-    # ─── 输出目录 ──────────────────────────────────────
+    # ─── 输出目录与文件日志 ────────────────────────────
     output_dir = Path(args.output_dir) if args.output_dir else OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ─── 文件日志 (v4: CSV 格式, 比控制台更详细) ────
     log_file = _open_log_file(output_dir / "training_log.csv",
                               resume=(args.resume is not None))
+
+    # ─── v32: 随机种子 + 新损失超参 (CLI 可覆盖) ────────
+    seed_everything(int(getattr(args, "seed", SEED)),
+                    bool(getattr(args, "deterministic", False)))
+    lambda_spatial = float(getattr(args, "lambda_spatial", LAMBDA_SPATIAL))
+    lambda_column = float(getattr(args, "lambda_column", LAMBDA_COLUMN))
+    len_fail_lambda = float(getattr(args, "len_fail_lambda", LEN_FAIL_LAMBDA))
+    daux_fake_w = float(getattr(args, "daux_fake_weight", D_AUX_FAKE_WEIGHT))
+    best_smooth = max(int(getattr(args, "best_smooth", BEST_SMOOTH_EPOCHS)), 1)
 
     # ─── 模型 ──────────────────────────────────────────
     G = Generator().to(DEVICE)
     D = Discriminator().to(DEVICE)
-
-    # ─── EMA (指数移动平均) ─────────────────────────
     ema_g = EMAGenerator(G, decay=EMA_DECAY)
     ema_g.to(DEVICE)
 
-    # ─── 优化器 ──────────────────────────────────────
+    # ─── 优化器 ────────────────────────────────────────
     g_optim = optim.Adam(G.parameters(), lr=args.lr_g,
                          betas=(args.beta1, args.beta2))
     d_optim = optim.Adam(D.parameters(), lr=args.lr_d,
                          betas=(args.beta1, args.beta2))
 
-    # ─── AMP 混合精度 (NPU 暂用纯 fp32, CUDA 用 AMP) ──
+    # ─── 混合精度 (NPU 用纯 fp32; CUDA 与 AM 二阶梯度不兼容, 同样 fp32) ──
     scaler = get_scaler() if use_amp() else None
     use_amp_flag = scaler is not None
 
-    # ─── ADA 自适应判别器增强 (v8) ──────────────────────
+    # ─── ADA 自适应判别器增强 ──────────────────────────
     if USE_ADA:
         ada = ADAAugment(target=ADA_TARGET, p_inc=ADA_P_INC,
                          p_dec=ADA_P_DEC, adjust_interval=ADA_INTERVAL)
@@ -757,7 +691,6 @@ def train(args):
         ada = None
 
     # ─── 学习率调度器 ──────────────────────────────────
-    # v14: 支持Cosine Annealing替代阶梯衰减
     if hasattr(args, 'use_cosine_lr') and args.use_cosine_lr:
         lr_min = getattr(args, 'lr_min', 1e-5)
         g_scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -777,10 +710,18 @@ def train(args):
     # ─── 断点续训 ──────────────────────────────────────
     start_epoch = 1
     global_step = 0
+    # v32: best ckpt 用 N-epoch 平滑外部比值, 避免 v31.1 那种单批 spike
+    best_ratio_score = float("inf")
+    best_ratio_epoch = -1
+    best_hist = deque(maxlen=best_smooth)
     if args.resume:
         ckpt = torch.load(args.resume, map_location=DEVICE, weights_only=True)
         G.load_state_dict(ckpt["generator_state_dict"])
         D.load_state_dict(ckpt["discriminator_state_dict"])
+        if ada is not None:
+            ada.p = float(ckpt.get("ada_p", 0.0))   # v32: 恢复 ADA 概率, 防续训重置
+        best_ratio_score = float(ckpt.get("best_ratio_score", float("inf")))
+        best_ratio_epoch = int(ckpt.get("best_ratio_epoch", -1))
         if "g_optimizer_state_dict" in ckpt and g_optim:
             g_optim.load_state_dict(ckpt["g_optimizer_state_dict"])
         if "d_optimizer_state_dict" in ckpt and d_optim:
@@ -789,8 +730,8 @@ def train(args):
             ema_g.load_state_dict(ckpt["ema_state_dict"])
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("global_step", 0)
-        # v28: 恢复 LR scheduler 状态; 旧检查点 (v26等) 无该字段则按 epoch 快进,
-        # 防止续训后 CosineAnnealing 从 last_epoch=0 重启导致 LR 跳回初始值
+        # 恢复 LR scheduler 状态; 旧检查点无该字段时按 epoch 快进,
+        # 防止余弦退火从 last_epoch=0 重启导致学习率跳回初始值。
         _sched_restored = False
         if "g_scheduler_state_dict" in ckpt and "d_scheduler_state_dict" in ckpt:
             try:
@@ -802,8 +743,8 @@ def train(args):
         if not _sched_restored:
             _ff = max(start_epoch - 1, 0)
             if _ff > 0:
-                # 快进仅调整 LR, 首次 optimizer.step() 前调用会触发 PyTorch 提示 —
-                # 此处为断点续训恢复场景, 安全忽略
+                # 快进仅调整 LR; 首次 optimizer.step() 前调用会触发 PyTorch
+                # 提示, 此处为断点续训恢复场景, 安全忽略。
                 import warnings as _warnings
                 with _warnings.catch_warnings():
                     _warnings.simplefilter("ignore", UserWarning)
@@ -814,30 +755,31 @@ def train(args):
                       f"(LR={g_optim.param_groups[0]['lr']:.2e})")
         print(f"[OK] 从 epoch {start_epoch - 1} 恢复训练 (global_step={global_step})\n")
     else:
-        # 正交初始化 (对 SpectralNorm + WGAN 更友好)
         G.apply(weights_init_ortho)
         D.apply(weights_init)
-        # 初始 EMA 副本
-        ema_g.update(G)
+        ema_g.update(G)  # 初始 EMA 副本
 
     # ─── 数据加载 ──────────────────────────────────────
     loader = get_dataloader(args.data_dir, batch_size=args.batch_size)
     pin_memory = device_supports_pin_memory()
 
-    # ─── 固定噪声用于采样可视化 ──────────────────────────
+    # ─── 固定噪声 (采样可视化用) ────────────────────────
     fixed_z = torch.randn(16, LATENT_DIM, device=DEVICE)
-    fixed_labels = torch.randint(0, NUM_CLASSES, (16, CAPTCHA_LENGTH), device=DEVICE)
-
-    # v5: 第二组固定噪声, 用于对比 EMA vs 训练 G
+    if FIXED_SAMPLE_REAL_DIST:
+        fixed_labels = sample_real_labels(16, DEVICE)
+        fixed_labels2 = sample_real_labels(16, DEVICE)
+    else:
+        fixed_labels = torch.randint(0, NUM_CLASSES, (16, CAPTCHA_LENGTH), device=DEVICE)
+        fixed_labels2 = torch.randint(0, NUM_CLASSES, (16, CAPTCHA_LENGTH), device=DEVICE)
+    # 第二组固定噪声: 对比 EMA 与训练中 G
     fixed_z2 = torch.randn(16, LATENT_DIM, device=DEVICE)
-    fixed_labels2 = torch.randint(0, NUM_CLASSES, (16, CAPTCHA_LENGTH), device=DEVICE)
 
-    # ─── 自适应训练状态跟踪 ────────────────────────────
-    d_real_ema = torch.tensor(0.0, device=DEVICE)   # v6: tensor 跟踪, 避免 per-step .item()
+    # ─── 自适应训练状态 ────────────────────────────────
+    d_real_ema = torch.tensor(0.0, device=DEVICE)   # tensor 跟踪, 避免 per-step 同步
     d_fake_ema = torch.tensor(0.0, device=DEVICE)
-    _consecutive_nan = 0  # v4.4: 连续 NaN 计数器, 超过阈值则停止训练
+    _consecutive_nan = 0  # 连续 NaN 计数器, 超过阈值停止训练
 
-    # ─── D 预训练 (v11: G预热前先训练D学会区分真假) ──
+    # ─── D 预训练: G 预热前先建立 D 基础判别力 ─────────
     if args.d_pretrain > 0 and not args.resume:
         print(f"\n  ═══ D 预训练阶段 ({args.d_pretrain} epochs): 建立D baseline判别力 ═══\n")
         d_pretrain_start = time.time()
@@ -865,10 +807,10 @@ def train(args):
                         aux_real.view(-1, NUM_CLASSES), labels.view(-1))
                     aux_loss_fake = aux_criterion(
                         aux_fake.view(-1, NUM_CLASSES), labels.view(-1))
-                    aux_loss_avg = (aux_loss_real + aux_loss_fake) / 2
+                    # v32: D aux 去共适应 — 默认只在真实数据训练 (daux_fake_w=0)
+                    aux_loss_avg = (aux_loss_real + daux_fake_w * aux_loss_fake) / (1.0 + daux_fake_w)
                     output_reg = 1e-4 * (d_real.mean() ** 2 + d_fake.mean() ** 2)
 
-                    # R1 penalty during pretraining
                     if LAMBDA_R1 > 0 and not NPU_DISABLE_R1:
                         r1_val = compute_r1_penalty(d_real.float(), real_imgs)
                     else:
@@ -883,7 +825,6 @@ def train(args):
                 else:
                     d_loss_total.backward()
 
-                # Gradient NaN check
                 _ok = all(_p.grad is None or torch.isfinite(_p.grad).all()
                           for _p in D.parameters() if _p.grad is not None)
                 if not _ok:
@@ -908,45 +849,42 @@ def train(args):
             print(f"  [D_PRETRAIN] Epoch {dpe}/{D_PRETRAIN_EPOCHS} | D Loss: {avg_dpe:.4f}")
         print(f"  ═══ D 预训练完成 ({time.time() - d_pretrain_start:.0f}s) ═══\n")
 
-    # ─── v26 OCR课程学习设置 ────────────────────────────────
+    # ─── OCR 课程学习设置 ──────────────────────────────
     use_curriculum = not args.no_curriculum
     cur_epochs = max(int(getattr(args, 'curriculum_epochs', CURRICULUM_EPOCHS)), 0)
     cur_ramp = max(int(getattr(args, 'curriculum_ramp', CURRICULUM_RAMP)), 0)
-    # v27: Phase C 混淆软目标 (机器干扰)
     _phase_c_epoch = max(int(getattr(args, 'phase_c_epoch', PHASE_C_EPOCHS)), 0)
     _phase_c_ramp = max(int(getattr(args, 'phase_c_ramp', PHASE_C_RAMP)), 0)
 
     def ocr_phase_of(ep: int):
-        """v26: 纯epoch函数 → (phase, t); 断点续训自动正确"""
+        """纯 epoch 函数 → (phase, t); 断点续训自动正确"""
         return curriculum_phase(ep, cur_epochs, cur_ramp, use_curriculum)
 
     if use_curriculum:
         print(f"  [OCR] 课程学习: Phase A(Ep1-{cur_epochs}, 仅CaptchaResNet强引导) → "
               f"Ramp(Ep{cur_epochs+1}-{cur_epochs+cur_ramp}, 线性混合) → "
-              f"Phase B(Ep{cur_epochs+cur_ramp+1}+, v25三OCR防欺骗)")
+              f"Phase B(Ep{cur_epochs+cur_ramp+1}+, 三OCR防欺骗)")
     else:
-        print(f"  [OCR] 课程学习已禁用 (--no-curriculum), 全程 v25 三OCR方案")
+        print(f"  [OCR] 课程学习已禁用 (--no-curriculum), 全程三OCR方案")
     if _phase_c_epoch > 0:
         print(f"  [OCR] Phase C(Ep{_phase_c_epoch}+): 混淆软目标 CE (ε爬升{_phase_c_ramp}ep) "
               f"— 机器干扰匹配 (ε_max={EPS_CAP})")
 
-    # ─── v22 分层OCR自适应监督 ──────────────────────────────
-    # 分层检测策略:
-    # 1. ppllocr + ddddocr 联合检测 (2个都超过阈值才算欺骗)，权重高
-    # 2. CaptchaResNet 单独检测，权重低 + 提供OCR监督损失
+    # ─── 分层 OCR 自适应监督 ────────────────────────────
+    # 1. ddddocr + ppllocr 联合检测 (2 个都超过阈值才算欺骗), 权重高
+    # 2. CaptchaResNet 单独检测, 权重低, 同时提供 OCR 监督损失
     adaptive_ocr = None
-    ocr_model = None  # CaptchaResNet，用于OCR监督损失
-    
+    ocr_model = None  # CaptchaResNet, 用于 OCR 监督损失
+
     if LAMBDA_OCR > 0:
         from adaptive_ocr import MultiOCRAdaptive
-        # v26: Phase A 不加载第三方OCR (省CPU), Ramp起点由 load_third_party() 幂等补载
+        # Phase A 不加载第三方 OCR (省 CPU), Ramp 起点由 load_third_party() 幂等补载
         _ph0, _t0 = ocr_phase_of(start_epoch)
         adaptive_ocr = MultiOCRAdaptive(
             device=DEVICE, load_third_party=(not use_curriculum) or _t0 > 0)
-        # 恢复CaptchaResNet，用于OCR监督损失
         if 'captcha_resnet' in adaptive_ocr.ocr_models:
             ocr_model = adaptive_ocr.ocr_models['captcha_resnet']
-        print(f"  [OCR] 启用分层OCR自适应监督 (v22)")
+        print(f"  [OCR] 启用分层OCR自适应监督")
         print(f"  [OCR] 初始权重: {adaptive_ocr.current_weight:.4f}")
         print(f"  [OCR] 已加载 {len(adaptive_ocr.ocr_models)} 个OCR模型")
         print(f"  [OCR] 第三方联合检测: ddddocr+ppllocr (2个都对才算欺骗)")
@@ -957,30 +895,28 @@ def train(args):
         print(f"  [OCR] 已禁用 (LAMBDA_OCR=0.0), 使用纯视觉质量监督")
 
     def get_ocr_lambda(ep: int, batch_idx: int = 0, fake_imgs=None, labels=None) -> float:
-        """获取当前OCR外层λ (v26: Phase A 固定λ无欺骗检测, Phase B 自适应)"""
+        """获取当前 OCR 外层权重 (Phase A 固定, Phase B 自适应检测欺骗)"""
         if LAMBDA_OCR <= 0 or adaptive_ocr is None:
             return 0.0
         if ep <= G_WARMUP_EPOCHS:
             return 0.0
 
-        # v26: Phase A (含Ramp) 固定权重, 不做欺骗检测 (第三方OCR可能未加载)
+        # Phase A 含 Ramp 阶段固定权重, 不做欺骗检测 (第三方 OCR 可能未加载)
         _ph, _t = ocr_phase_of(ep)
         if _t < 1.0:
             ocr_weight = LAMBDA_OCR
         elif fake_imgs is not None and labels is not None:
-            # v22: 使用分层检测的权重 (仅 Phase B)
             if batch_idx % 100 == 0:
                 ocr_weight, accuracies, is_cheating, cheating_models = adaptive_ocr.check_and_update(
                     fake_imgs.detach(), labels
                 )
-                # 记录到日志
                 if batch_idx % 500 == 0:
                     print(f"  [OCR] {adaptive_ocr.get_summary()}")
             else:
                 ocr_weight = adaptive_ocr.current_weight
         else:
             ocr_weight = adaptive_ocr.current_weight
-        
+
         # 预热期渐进引入
         ramp = OCR_WARMUP_EPOCHS
         if ep <= G_WARMUP_EPOCHS + ramp:
@@ -992,18 +928,16 @@ def train(args):
     t_start = time.time()
 
     for epoch in range(start_epoch, args.epochs + 1):
-        # 阶段判断
-        in_g_warmup = (G_WARMUP_EPOCHS > 0 and
-                       epoch <= G_WARMUP_EPOCHS)
+        in_g_warmup = (G_WARMUP_EPOCHS > 0 and epoch <= G_WARMUP_EPOCHS)
         in_adv_warmup = (not in_g_warmup and G_WARMUP_EPOCHS > 0 and
                          epoch <= G_WARMUP_EPOCHS + ADV_WARMUP_EPOCHS)
-        # v26: OCR课程学习阶段 (纯epoch函数, 断点续训自动正确)
+        # OCR 课程学习阶段 (纯 epoch 函数, 断点续训自动正确)
         ocr_ph, ocr_t = ocr_phase_of(epoch)
-        # v27: Phase C 混淆软目标 ε 爬升 (Ep300起, Ep300-305线性)
+        # Phase C 混淆软目标 ε 爬升
         ocr_pc, ocr_pc_t = phase_c_t(epoch, _phase_c_epoch, _phase_c_ramp)
         if ocr_pc:
             ocr_ph = "C" if ocr_t >= 1.0 else ocr_ph   # 日志标签
-        # ocr_ramp 语义: Phase C(且已入B) 记 ε 爬升系数, 否则记 A→B 混合系数
+        # ocr_ramp: Phase C(且已入 B) 记 ε 爬升系数, 否则记 A→B 混合系数
         ocr_ramp_v = float(ocr_pc_t) if (ocr_pc and ocr_t >= 1.0) else float(ocr_t)
         if ocr_t > 0 and adaptive_ocr is not None:
             # 幂等: Ramp 起点补载第三方 OCR (Phase A 未加载)
@@ -1020,63 +954,72 @@ def train(args):
         epoch_aux_loss = 0.0
         epoch_fm_loss = 0.0
         epoch_contrast_loss = 0.0
-        epoch_div_loss = 0.0     # v6: 多样性损失跟踪
-        epoch_edge_loss = 0.0     # v10: Sobel边缘损失跟踪
-        epoch_realism_loss = 0.0  # v10: 分布匹配损失跟踪
-        epoch_ocr_loss = 0.0      # v13: 强OCR字形监督损失跟踪
-        epoch_ocr_ce = 0.0        # v25: OCR CE 分量
-        epoch_ocr_feat = 0.0      # v25: OCR 特征匹配分量
-        epoch_ocr_lambda = 0.0    # v25: 外层自适应λ
-        epoch_ocr_w_mean = 0.0    # v25: 字符级权重均值
-        epoch_ocr_valid = 0.0     # v25: 有效字符占比
-        epoch_ocr_acc = 0.0       # v27: CaptchaResNet整串acc (修正v26混用D-Aux语义)
-        epoch_dddd_acc = 0.0      # v27: 第三方OCR acc (机器识别水平)
+        epoch_div_loss = 0.0
+        epoch_edge_loss = 0.0
+        epoch_realism_loss = 0.0
+        epoch_ocr_loss = 0.0
+        epoch_ocr_ce = 0.0
+        epoch_ocr_feat = 0.0
+        epoch_ocr_lambda = 0.0
+        epoch_ocr_w_mean = 0.0
+        epoch_ocr_valid = 0.0
+        epoch_ocr_acc = 0.0
+        epoch_dddd_acc = 0.0
         epoch_ppll_acc = 0.0
-        epoch_dddd_n = 0          # v28: 实测样本计数 (统计均值时排除未测量 -1)
+        epoch_dddd_n = 0          # 实测样本计数 (统计均值时排除未测量 -1)
         epoch_ppll_n = 0
-        epoch_gap_ink = 0.0       # v27: gap墨迹比 (M7)
-        epoch_aux_acc_real = 0.0  # v5: 验证指标 — D Aux 在真实数据上的准确率
-        epoch_aux_acc_fake = 0.0  # v5: 验证指标 — D Aux 在假数据上的准确率
-        epoch_perfect_acc_real = 0.0  # v17: 整串正确率 — 真实数据
-        epoch_perfect_acc_fake = 0.0  # v17: 整串正确率 — 生成数据
+        epoch_gap_ink = 0.0
+        epoch_aux_acc_real = 0.0
+        epoch_aux_acc_fake = 0.0
+        epoch_perfect_acc_real = 0.0
+        epoch_perfect_acc_fake = 0.0
         epoch_batches = 0
+        # v32: 新增指标 / epoch 汇总的梯度与 R1/R2 (v28 汇总行原来写 0)
+        epoch_spatial = 0.0
+        epoch_struct = 0.0
+        epoch_column = 0.0
+        epoch_len_fail = 0.0
+        epoch_len_fail_n = 0
+        epoch_dddd_len = 0.0
+        epoch_ppll_len = 0.0
+        epoch_r1_t = torch.zeros((), device=DEVICE)
+        epoch_r2_t = torch.zeros((), device=DEVICE)
+        epoch_dgrad_t = torch.zeros((), device=DEVICE)
+        epoch_ggrad_t = torch.zeros((), device=DEVICE)
 
         for batch_idx, (real_imgs, labels) in enumerate(loader):
             B = real_imgs.size(0)
             real_imgs = real_imgs.to(DEVICE, non_blocking=pin_memory)
             labels = labels.to(DEVICE, non_blocking=pin_memory)
 
-            # ─── D 更新频率 (v11: 自适应, 根据D Gap动态调整) ──
+            # ─── D 更新频率 (根据判别间隙自适应) ──────────
             d_updates = get_adaptive_d_updates(
                 d_real_ema.item(), d_fake_ema.item())
 
             # ═════════════════════════════════════════
-            #  训练判别器 D (v4: 加入 R1 梯度惩罚)
+            #  训练判别器 D
             # ═════════════════════════════════════════
-            cached_real_features = None  # 缓存 D(real) 特征, 避免 G 步骤重复计算
+            cached_real_features = None  # 缓存 D(real) 特征, 避免 G 步重复计算
             r1_penalty_val = torch.tensor(0.0, device=DEVICE)
-            _skip_g_step = False       # v4.1: D 梯度异常时跳过 G 训练
-            # v12: D 训练步 d_real/d_fake 快照 (供日志, 防止被 G 步覆盖)
+            _skip_g_step = False         # D 梯度异常时跳过 G 训练
             _d_real_dstep = torch.tensor(0.0, device=DEVICE)
             _d_fake_dstep = torch.tensor(0.0, device=DEVICE)
 
             for d_iter in range(d_updates):
                 d_optim.zero_grad()
 
-                # 生成假图
                 z = torch.randn(B, LATENT_DIM, device=DEVICE)
                 with torch.no_grad():
                     fake_imgs = G(z, labels)
 
-                # D 前向: 始终收集特征 (FM loss 在所有阶段生效)
-                need_features = (d_iter == d_updates - 1)  # v9u: 预热期也收集
+                need_features = (d_iter == d_updates - 1)  # 最后一次迭代收集特征
                 need_r1 = (d_iter == d_updates - 1)
 
                 if need_r1:
                     real_imgs.requires_grad_(True)
 
                 with autocast():
-                    # v8: ADA 增强 — 对 D 输入应用随机变换, 防止过拟合
+                    # ADA 增强: 对 D 输入应用随机变换, 防止过拟合
                     if ada is not None:
                         _real_for_d = ada.augment(real_imgs, ada.p) if ada.p > 0 else real_imgs
                         _fake_for_d = ada.augment(fake_imgs.detach(), ada.p) if ada.p > 0 else fake_imgs.detach()
@@ -1090,29 +1033,22 @@ def train(args):
                         d_real, aux_real, _ = D(_real_for_d, labels)
                     d_fake, aux_fake, _ = D(_fake_for_d, labels)
 
-                    if _USE_HINGE_LOSS:
-                        # ─── Hinge Loss (全设备统一) ───
-                        d_loss_adv = (F.relu(1.0 + d_fake).mean() +
-                                      F.relu(1.0 - d_real).mean())
-                        gp = torch.tensor(0.0, device=DEVICE)
-                    else:
-                        # ─── WGAN 对抗损失 (已废弃, 保留兼容) ───
-                        d_loss_adv = d_fake.mean() - d_real.mean()
-                        gp = compute_gradient_penalty(D, real_imgs, fake_imgs.detach(), labels)
+                    # Hinge 对抗损失
+                    d_loss_adv = (F.relu(1.0 + d_fake).mean() +
+                                  F.relu(1.0 - d_real).mean())
 
-                    # --- Aux 分类损失 ---
                     aux_loss_real = aux_criterion(
                         aux_real.view(-1, NUM_CLASSES), labels.view(-1))
                     aux_loss_fake = aux_criterion(
                         aux_fake.view(-1, NUM_CLASSES), labels.view(-1))
-                    aux_loss_avg = (aux_loss_real + aux_loss_fake) / 2
+                    # v32: D aux 去共适应 — 默认只在真实数据训练 (daux_fake_w=0)
+                    aux_loss_avg = (aux_loss_real + daux_fake_w * aux_loss_fake) / (1.0 + daux_fake_w)
 
-                    # --- 输出正则化 (Hinge 天然限幅, 仅需弱正则化) ---
-                    _oreg = 1e-4 if _USE_HINGE_LOSS else 3e-3
-                    output_reg = _oreg * (d_real.mean() ** 2 + d_fake.mean() ** 2)
+                    # 输出弱正则化 (Hinge 天然限幅)
+                    output_reg = 1e-4 * (d_real.mean() ** 2 + d_fake.mean() ** 2)
 
-                # --- R1 梯度惩罚 (v6: NPU 上默认禁用, 避免二阶梯度维度不匹配) ---
-                if need_r1 and _USE_HINGE_LOSS and LAMBDA_R1 > 0 and not NPU_DISABLE_R1:
+                # R1 梯度惩罚 (NPU 上默认禁用, 避免二阶梯度维度不匹配)
+                if need_r1 and LAMBDA_R1 > 0 and not NPU_DISABLE_R1:
                     cur_r1_lambda = get_r1_lambda(global_step)
                     if cur_r1_lambda > 0:
                         r1_penalty_val = compute_r1_penalty(d_real.float(), real_imgs)
@@ -1122,17 +1058,12 @@ def train(args):
                     r1_penalty_val = torch.tensor(0.0, device=DEVICE)
                     cur_r1_lambda = 0.0
 
-                # --- R2 梯度惩罚 (v7: 假数据梯度, R1+R2 联合平衡 D) ---
-                # R2 在最后 D 迭代且不在预热期内计算 (与 R1 同步)
-                # NPU 上默认禁用 (二阶梯度维度不匹配风险)
-                # 注意: 需要 re-forward D(fake) 且 fake_imgs 带 grad,
-                #       因为之前 D(fake) 使用了 fake_imgs.detach(), 梯度链已断开
-                if need_r1 and _USE_HINGE_LOSS and LAMBDA_R2 > 0 and not NPU_DISABLE_R2:
+                # R2 梯度惩罚 (需 re-forward D(fake) 且 fake 带 grad)
+                if need_r1 and LAMBDA_R2 > 0 and not NPU_DISABLE_R2:
                     cur_r2_lambda = get_r2_lambda(global_step)
                     if cur_r2_lambda > 0:
                         fake_imgs.requires_grad_(True)
                         with autocast():
-                            # Re-forward: fake_imgs with grad → D backbone → disc_head
                             d_fake_r2, _, _ = D(fake_imgs, labels)
                         r2_penalty_val = compute_r2_penalty(d_fake_r2.float(), fake_imgs)
                         fake_imgs.requires_grad_(False)
@@ -1142,9 +1073,7 @@ def train(args):
                     r2_penalty_val = torch.tensor(0.0, device=DEVICE)
                     cur_r2_lambda = 0.0
 
-                # --- D 总损失 (v7: 加入 R2 梯度惩罚) ---
                 d_loss_total = (d_loss_adv +
-                                LAMBDA_GP * gp +
                                 LAMBDA_AUX_D * aux_loss_avg +
                                 cur_r1_lambda * r1_penalty_val +
                                 cur_r2_lambda * r2_penalty_val +
@@ -1156,7 +1085,7 @@ def train(args):
                 else:
                     d_loss_total.backward()
 
-                # v4.1: 梯度 NaN 检测, 防止污染模型权重
+                # 梯度 NaN 检测, 防止污染模型权重
                 _d_grad_ok = True
                 for _name, _p in D.named_parameters():
                     if _p.grad is not None and (not torch.isfinite(_p.grad).all()):
@@ -1184,28 +1113,24 @@ def train(args):
 
                 # 更新 EMA 统计 (仅在最后一次 D 迭代)
                 if d_iter == d_updates - 1:
-                    # v6: detach() 替代 .item(), 消除 per-step NPU→CPU 同步
                     d_real_ema = 0.99 * d_real_ema + 0.01 * d_real.mean().detach()
                     d_fake_ema = 0.99 * d_fake_ema + 0.01 * d_fake.mean().detach()
-                    real_imgs.requires_grad_(False)  # v4: 清理 R1 梯度标记
-                    # v8: 更新 ADA 增强概率 (基于 D 对真实数据表现)
+                    real_imgs.requires_grad_(False)
+                    # ADA 增强概率更新 (基于 D 对真实数据表现)
                     if ada is not None:
                         ada.update_p(d_real.mean().detach().item())
-                    # v5: 记录 Aux 分类准确率作为验证指标
+                    # 记录 Aux 分类准确率作为验证指标
                     _acc_real = compute_aux_accuracy(aux_real.detach(), labels)
                     _acc_fake = compute_aux_accuracy(aux_fake.detach(), labels)
                     epoch_aux_acc_real += _acc_real
                     epoch_aux_acc_fake += _acc_fake
 
-                    # v17: 记录整串正确率
                     _perfect_real = compute_perfect_accuracy(aux_real.detach(), labels)
                     _perfect_fake = compute_perfect_accuracy(aux_fake.detach(), labels)
                     epoch_perfect_acc_real += _perfect_real
                     epoch_perfect_acc_fake += _perfect_fake
 
-                    # v12: 捕获 D 训练步的真实 d_real/d_fake (供日志)
-                    # v11 日志 bug: 日志在 G 步之后读取 d_fake, 已被 G 步的
-                    # D(fake_imgs) 前向覆盖, 导致 d_gap 恒≈0 的假崩溃假象
+                    # 捕获 D 训练步的 d_real/d_fake (供日志; 防止被 G 步覆盖)
                     _d_real_dstep = d_real.mean().detach()
                     _d_fake_dstep = d_fake.mean().detach()
 
@@ -1213,15 +1138,13 @@ def train(args):
             #  训练生成器 G
             # ═════════════════════════════════════════
             if _skip_g_step:
-                # v4.4: D 梯度异常, 跳过 G 训练, 但 global_step 已在 D 处理中递增
                 g_optim.zero_grad()
                 continue
 
             z = torch.randn(B, LATENT_DIM, device=DEVICE)
             g_optim.zero_grad()
 
-            # v12: 同标签双z多样性 — 对同一批 labels 用第二个噪声再生成一张
-            # (半batch降本, 给 z 路径直接梯度压力, 根治 z 被忽略)
+            # 同标签双噪声多样性: 半 batch 降本, 给噪声路径直接梯度压力
             _div_half = max(1, B // 2)
             z2 = torch.randn(_div_half, LATENT_DIM, device=DEVICE)
 
@@ -1230,10 +1153,8 @@ def train(args):
                 fake_imgs2 = G(z2, labels[:_div_half])
                 d_fake, aux_fake, fake_features = D(fake_imgs, labels, return_features=True)
 
-                # --- v25: 双向对比度匹配 (替换 v10-v24 单向下限) ---
-                # v20诊断: 生成 tanh std≈0.80 ≫ 旧阈值0.15 → relu(0.15-std)恒=0
-                #          (5080/5080行, LAMBDA_CONTRAST=3.0完全浪费); 真实 std≈0.40
-                # 双侧 hinge: 每图 std 落入真实分布带 [q10-margin, q90+margin], 过高过低都罚
+                # 双向对比度匹配: 每图 std 落入真实分布带 [q10-margin, q90+margin],
+                # 过高 (过噪) 过低 (灰糊) 都惩罚。
                 fake_std = fake_imgs.view(B, -1).std(dim=1)               # (B,)
                 with torch.no_grad():
                     real_std = real_imgs.detach().view(B, -1).std(dim=1)  # (B,)
@@ -1242,54 +1163,67 @@ def train(args):
                 contrast_loss = (F.relu(_ctr_lo - fake_std) +
                                  F.relu(fake_std - _ctr_hi)).mean()
 
-                # --- v10: 边缘损失 & 分布匹配 (仅在非预热或预热后期生效) ---
                 cur_edge_loss = edge_loss(fake_imgs, real_imgs)
                 cur_realism_loss = realism_loss(fake_imgs, real_imgs)
 
-                # --- v28: 反粘连 gap 墨迹 hinge (Ep6+ 且 --lambda-gap>0 才启用) ---
-                # v27 教训: 无下界最小化把 gap 比压到 0 → 硬间隙/断笔 → 退步 v26.
-                # v28: 仅罚超限 (relu(ratio-GAP_RATIO_MAX)), 默认 LAMBDA_GAP=0 关闭.
+                # 反粘连 gap 墨迹 hinge (预热后且 --lambda-gap>0 才启用)
                 if epoch > G_WARMUP_EPOCHS and args.lambda_gap > 0:
                     cur_gap_loss = gap_ink_loss(fake_imgs)
                 else:
                     cur_gap_loss = torch.tensor(0.0, device=DEVICE)
-                gap_ink_v = gap_ink_ratio(fake_imgs)   # v27: M7 日志指标
+                gap_ink_v = gap_ink_ratio(fake_imgs)
+                # v32: 每步列墨迹剖面分布匹配 (可导, 直接约束横向字符占用/粘连)
+                real_col_prof = column_ink_profile(real_imgs.detach())
+                fake_col_prof = column_ink_profile(fake_imgs)
+                column_loss = F.l1_loss(fake_col_prof, real_col_prof.detach())
 
-                # v14: 动态Edge Loss权重 — 防止Edge Loss衰减过快
+                # 动态 Edge Loss 权重 — 防止边缘监督衰减过快
                 edge_lambda = LAMBDA_EDGE
                 if hasattr(args, 'edge_loss_min') and cur_edge_loss.item() < args.edge_loss_min:
-                    edge_lambda = LAMBDA_EDGE * 2.0  # Edge Loss过低时权重翻倍
+                    edge_lambda = LAMBDA_EDGE * 2.0
 
-                # --- v26: 课程学习 OCR 监督 ---
-                # Phase A: 仅CaptchaResNet, CE全幅(v20式 ÷w.sum()) + FM不加权 → 冷启动可读性
-                # Ramp:   A/B 线性混合 (权重 + 归一化方式)
-                # Phase B: v25 字符级96格权重表, CE÷(B*4)固定分母 → 防欺骗
+                # ─── OCR 监督 (课程学习) ─────────────────
+                # Phase A: 仅 CaptchaResNet, CE 全幅 + FM 不加权 → 冷启动可读性
+                # Phase B: 字符级 96 格权重表, CE 固定分母 → 防欺骗
                 cur_ocr_lambda = get_ocr_lambda(epoch, batch_idx, fake_imgs, labels)
                 if cur_ocr_lambda > 0 and ocr_model is not None:
-                    # OCR 前向 (CE + 特征匹配, 带梯度)
                     ocr_logits, ocr_feat_f = ocr_model(fake_imgs, return_features=True)
                     _, ocr_feat_r = ocr_model(real_imgs, return_features=True)
 
-                    # v27: Phase C 混淆软目标 CE (t=0≡硬CE, Ep300-305 ε线性爬升)
+                    # Phase C 混淆软目标 CE (t=0 ≡ 硬 CE)
+                    # v32: 硬 CE 始终计算 — struct loss 需要真实标签目标,
+                    #       不能拿混淆软目标去教"结构失败样本".
+                    hard_ce_char = F.cross_entropy(
+                        ocr_logits.view(-1, NUM_CLASSES),
+                        labels.view(-1),
+                        reduction='none').view(B, CAPTCHA_LENGTH)   # (B,4)
                     if ocr_pc and ocr_pc_t > 0.0:
                         ce_char = soft_ce(ocr_logits, labels,
                                           _SOFT_DIST, _SOFT_EPS, ocr_pc_t)
                     else:
-                        ce_char = F.cross_entropy(
-                            ocr_logits.view(-1, NUM_CLASSES),
-                            labels.view(-1),
-                            reduction='none').view(B, CAPTCHA_LENGTH)   # (B,4)
+                        ce_char = hard_ce_char
 
-                    # 权重计算 (v26: 按阶段选择策略; v27: Phase C 目标态映射)
+                    # 权重计算 (按阶段选择策略)
+                    # v32: 结构失败门控 — 只有该 OCR 的平滑长度错误率超过
+                    # 真实目标时才把它的长度错误视为结构失败 (避免把 dddd
+                    # 从 7.25% 继续逼向 0, 那是 M2/M4 的反方向).
+                    _td = OCR_LEN_TARGET["ddddocr"] + LEN_TARGET_MARGIN
+                    _tp = OCR_LEN_TARGET["ppllocr"] + LEN_TARGET_MARGIN
+                    _de = adaptive_ocr.ema_len_err.get("ddddocr", -1.0)
+                    _pe = adaptive_ocr.ema_len_err.get("ppllocr", -1.0)
+                    _len_apply = ((_de < 0) or (_de > _td),
+                                  (_pe < 0) or (_pe > _tp))
+                    len_fail_mask = None
                     if ocr_t < 1.0:
-                        # Phase A / Ramp: 快速路径 C-only (第三方可能未加载, 不触发)
-                        w_fast, _ = adaptive_ocr.compute_char_weights(
+                        # Phase A / Ramp: 快速路径 C-only (第三方可能未加载)
+                        w_fast, info_fast = adaptive_ocr.compute_char_weights(
                             fake_imgs.detach(), labels,
                             ocr_logits=ocr_logits.detach(), max_samples=0,
-                            phase_c=ocr_pc)
+                            phase_c=ocr_pc, len_apply=_len_apply)
+                        len_fail_mask = info_fast.get("len_fail_mask")
                     if ocr_t > 0.0:
-                        # Ramp / Phase B: 分层三方评估 → 96格主表
-                        # (每步C快速路径; 每10/50/100步三方抽样/全量)
+                        # Ramp / Phase B: 分层三方评估 → 96 格主表
+                        # (每步快速路径; 每 10/50/100 步抽样/全量三方)
                         if batch_idx % 100 == 0:
                             _n_full = None          # 全量三方
                         elif batch_idx % 50 == 0:
@@ -1297,13 +1231,14 @@ def train(args):
                         elif batch_idx % 10 == 0:
                             _n_full = 10
                         else:
-                            _n_full = 0             # 仅C快速路径
-                        w_full, _ = adaptive_ocr.compute_char_weights(
+                            _n_full = 0             # 仅 C 快速路径
+                        w_full, info_full = adaptive_ocr.compute_char_weights(
                             fake_imgs.detach(), labels,
                             ocr_logits=ocr_logits.detach(), max_samples=_n_full,
-                            phase_c=ocr_pc)
+                            phase_c=ocr_pc, len_apply=_len_apply)
+                        len_fail_mask = info_full.get("len_fail_mask")
 
-                    # CE: Phase A全幅(v20式 ÷w.sum(), 权重永不为0即全幅) ↔ Phase B固定分母
+                    # CE: Phase A 全幅 ↔ Phase B 固定分母
                     if ocr_t <= 0.0:
                         char_w = w_fast
                         ocr_ce = (ce_char * w_fast).sum() / w_fast.sum().clamp(min=1e-8)
@@ -1317,8 +1252,21 @@ def train(args):
                         _ce_b = (ce_char * w_full).sum() / float(B * CAPTCHA_LENGTH)
                         ocr_ce = (1.0 - ocr_t) * _ce_a + ocr_t * _ce_b
 
-                    # 特征匹配 (v26: 恢复v20式不加权 — FM是v20质量功臣, 无欺骗风险)
+                    # 特征匹配全程不加权 (批级分布匹配, 不诱导欺骗)
                     ocr_feat_m = ocr_net.ocr_feature_loss(ocr_feat_f, ocr_feat_r)
+                    # v32: 空间矩损失 (旧特征损失只匹配 channel 均值)
+                    spatial_loss = ocr_net.ocr_spatial_loss(ocr_feat_f, ocr_feat_r)
+
+                    # v32: 结构 CE — 第三方串长≠4 的样本, 用硬目标单独加梯度;
+                    #      不乘 λ_read, 否则地板期 (0.02) 时仍然几乎为 0.
+                    struct_loss = torch.tensor(0.0, device=DEVICE)
+                    len_fail_ratio_v = 0.0
+                    if len_fail_mask is not None:
+                        _lf = len_fail_mask.float()
+                        len_fail_ratio_v = float(_lf.mean())
+                        if bool(len_fail_mask.any()):
+                            _hf = hard_ce_char.mean(dim=1)
+                            struct_loss = (_hf * _lf).sum() / _lf.sum().clamp(min=1.0)
 
                     ocr_loss_val = (OCR_CE_WEIGHT * ocr_ce +
                                     (1.0 - OCR_CE_WEIGHT) * ocr_feat_m)
@@ -1334,9 +1282,12 @@ def train(args):
                     ocr_acc_item = torch.tensor(0.0, device=DEVICE)
                     ocr_w_mean_v = 0.0
                     ocr_valid_ratio = 0.0
+                    spatial_loss = torch.tensor(0.0, device=DEVICE)
+                    struct_loss = torch.tensor(0.0, device=DEVICE)
+                    len_fail_ratio_v = 0.0
 
-                # v27: 第三方OCR准确率 (复用 check_and_update 每100步已有计算, 零额外开销)
-                # v28: 未测量记 -1.0 (Phase A 不加载第三方OCR), 区分"未测"与"真0"
+                # 第三方 OCR 准确率 (复用 check_and_update 的计算, 零额外开销)
+                # 未测量记 -1.0 (Phase A 不加载第三方 OCR), 区分"未测"与"真0"
                 dddd_acc_v = ppll_acc_v = -1.0
                 if adaptive_ocr is not None:
                     _ah = getattr(adaptive_ocr, "accuracy_history", {})
@@ -1350,7 +1301,6 @@ def train(args):
                     aux_loss = aux_criterion(
                         aux_fake.view(-1, NUM_CLASSES), labels.view(-1))
                     div_loss = diversity_loss(fake_imgs[:_div_half], fake_imgs2)
-                    # v10: FM loss + Edge + Realism 预热期也生效
                     if cached_real_features is not None:
                         fm_loss = feature_matching_loss(cached_real_features, fake_features)
                     else:
@@ -1361,12 +1311,15 @@ def train(args):
                                     LAMBDA_DIVERSITY * div_loss +
                                     edge_lambda * cur_edge_loss +
                                     LAMBDA_REALISM * cur_realism_loss +
-                                    args.lambda_gap * cur_gap_loss +     # v28 反粘连(默认0)
-                                    cur_ocr_lambda * ocr_loss_val)
+                                    args.lambda_gap * cur_gap_loss +
+                                    cur_ocr_lambda * ocr_loss_val +
+                                    lambda_spatial * spatial_loss +
+                                    len_fail_lambda * struct_loss +
+                                    lambda_column * column_loss)
                     cur_adv_lambda = 0.0
                     cur_fm_lambda = LAMBDA_FM
                 else:
-                    # ═══ 渐进对抗训练 (v10): 对抗+Aux+FM三足鼎立 + Edge + Realism ═══
+                    # ═══ 渐进对抗训练: 对抗 + Aux + FM 三足鼎立 + 视觉质量约束 ═══
                     cur_adv_lambda = get_adv_lambda(epoch, G_WARMUP_EPOCHS)
                     g_loss_adv = -d_fake.mean() * cur_adv_lambda
 
@@ -1388,20 +1341,25 @@ def train(args):
                                     LAMBDA_DIVERSITY * div_loss +
                                     edge_lambda * cur_edge_loss +
                                     LAMBDA_REALISM * cur_realism_loss +
-                                    args.lambda_gap * cur_gap_loss +     # v28 反粘连(默认0)
-                                    cur_ocr_lambda * ocr_loss_val)
+                                    args.lambda_gap * cur_gap_loss +
+                                    cur_ocr_lambda * ocr_loss_val +
+                                    lambda_spatial * spatial_loss +
+                                    len_fail_lambda * struct_loss +
+                                    lambda_column * column_loss)
 
-            # v6: detach() 替代 .item(), 避免 per-step NPU→CPU 同步
-            # (标量 tensor 留在 NPU 上累积, 仅在日志间隔 sync)
+            # detach 替代 .item(), 避免 per-step 设备同步 (日志间隔才 sync)
             g_item = g_loss_total.detach()
             fm_item = fm_loss.detach()
             contrast_item = contrast_loss.detach()
             div_item = div_loss.detach()
-            edge_item = cur_edge_loss.detach()    # v10
-            realism_item = cur_realism_loss.detach()  # v10
-            ocr_item = ocr_loss_val.detach()          # v13
-            ocr_ce_item = ocr_ce.detach()             # v25
-            ocr_feat_item = ocr_feat_m.detach()       # v25
+            edge_item = cur_edge_loss.detach()
+            realism_item = cur_realism_loss.detach()
+            ocr_item = ocr_loss_val.detach()
+            ocr_ce_item = ocr_ce.detach()
+            ocr_feat_item = ocr_feat_m.detach()
+            spatial_item = spatial_loss.detach()
+            struct_item = struct_loss.detach()
+            column_item = column_loss.detach()
 
             if use_amp_flag:
                 scaler.scale(g_loss_total).backward()
@@ -1409,7 +1367,7 @@ def train(args):
             else:
                 g_loss_total.backward()
 
-            # v4.1: G 梯度 NaN 检测
+            # G 梯度 NaN 检测
             _g_grad_ok = True
             for _name, _p in G.named_parameters():
                 if _p.grad is not None and (not torch.isfinite(_p.grad).all()):
@@ -1440,16 +1398,11 @@ def train(args):
             global_step += 1
 
             # ─── 记录 ────────────────────────────────
-            _consecutive_nan = 0  # v4.4: 正常步, 重置连续 NaN 计数
-            # v6: detach() 替代 .item(), 避免 per-step NPU→CPU 同步
+            _consecutive_nan = 0  # 正常步, 重置连续 NaN 计数
             d_item = d_loss_total.detach()
             aux_item = aux_loss.detach()
-            if isinstance(gp, torch.Tensor):
-                gp_item = gp.detach()
-            else:
-                gp_item = torch.tensor(0.0, device=DEVICE)
 
-            # 检测 NaN (v4.4: 已由梯度 NaN 守卫处理, 这里是最后的兜底)
+            # NaN 兜底检测
             if torch.isnan(d_loss_total) or torch.isnan(g_loss_total):
                 _consecutive_nan += 1
                 print(f"  [WARN] Loss NaN at step {global_step} (连续{_consecutive_nan}次), 跳过记录和 EMA")
@@ -1461,26 +1414,39 @@ def train(args):
             epoch_aux_loss += aux_item
             epoch_fm_loss += fm_item
             epoch_contrast_loss += contrast_item
-            epoch_div_loss += div_item  # v6
-            epoch_edge_loss += edge_item  # v10
-            epoch_realism_loss += realism_item  # v10
-            epoch_ocr_loss += ocr_item          # v13
-            epoch_ocr_ce += ocr_ce_item         # v25
-            epoch_ocr_feat += ocr_feat_item     # v25
-            epoch_ocr_lambda += cur_ocr_lambda  # v25
-            epoch_ocr_w_mean += ocr_w_mean_v    # v25
-            epoch_ocr_valid += ocr_valid_ratio  # v25
-            epoch_ocr_acc += ocr_acc_item.detach()        # v27
-            if dddd_acc_v >= 0:                           # v28: 仅统计实测
+            epoch_div_loss += div_item
+            epoch_edge_loss += edge_item
+            epoch_realism_loss += realism_item
+            epoch_ocr_loss += ocr_item
+            epoch_ocr_ce += ocr_ce_item
+            epoch_ocr_feat += ocr_feat_item
+            epoch_ocr_lambda += cur_ocr_lambda
+            epoch_ocr_w_mean += ocr_w_mean_v
+            epoch_ocr_valid += ocr_valid_ratio
+            epoch_ocr_acc += ocr_acc_item.detach()
+            epoch_spatial += float(spatial_item)
+            epoch_struct += float(struct_item)
+            epoch_column += float(column_item)
+            epoch_len_fail += len_fail_ratio_v
+            epoch_len_fail_n += 1
+            if dddd_acc_v >= 0:                           # 仅统计实测
                 epoch_dddd_acc += dddd_acc_v
                 epoch_dddd_n += 1
-            if ppll_acc_v >= 0:                           # v28: 仅统计实测
+                if adaptive_ocr is not None:
+                    epoch_dddd_len += float(adaptive_ocr.last_len_err.get("ddddocr", -1.0))
+            if ppll_acc_v >= 0:
                 epoch_ppll_acc += ppll_acc_v
                 epoch_ppll_n += 1
-            epoch_gap_ink += gap_ink_v                    # v27
+                if adaptive_ocr is not None:
+                    epoch_ppll_len += float(adaptive_ocr.last_len_err.get("ppllocr", -1.0))
+            epoch_gap_ink += gap_ink_v
+            epoch_r1_t += r1_penalty_val.detach() if isinstance(r1_penalty_val, torch.Tensor) else 0.0
+            epoch_r2_t += r2_penalty_val.detach() if isinstance(r2_penalty_val, torch.Tensor) else 0.0
+            epoch_dgrad_t += d_grad_norm.detach() if isinstance(d_grad_norm, torch.Tensor) else 0.0
+            epoch_ggrad_t += g_grad_norm.detach() if isinstance(g_grad_norm, torch.Tensor) else 0.0
             epoch_batches += 1
 
-            # ─── 日志 (v6: 仅在此时 sync NPU→CPU, 而非每步) ───
+            # ─── 控制台日志 ───────────────────────────
             if global_step % args.log_interval == 0:
                 elapsed = time.time() - t_start
                 ips = global_step / elapsed if elapsed > 0 else 0
@@ -1488,30 +1454,25 @@ def train(args):
                 cur_lr_d = d_optim.param_groups[0]["lr"]
                 r1_item = r1_penalty_val.item() if isinstance(r1_penalty_val, torch.Tensor) else 0.0
                 r2_item = r2_penalty_val.item() if isinstance(r2_penalty_val, torch.Tensor) else 0.0
-                cur_fm_lambda = LAMBDA_FM  # v9u: 固定权重
                 cur_adv_lambda = get_adv_lambda(epoch, G_WARMUP_EPOCHS) if not in_g_warmup else 0.0
-                # v6: 仅在日志时 sync, 批量提取标量值
                 _d_val = d_item.item()
                 _g_val = g_item.item()
                 _aux_val = aux_item.item()
                 _fm_val = fm_item.item()
                 _ctr_val = contrast_item.item()
                 _div_val = div_item.item()
-                _edge_val = edge_item.item()      # v10
-                _real_val = realism_item.item()   # v10
-                # v12: 使用 D 训练步快照 (v11 用 G 步覆盖后的 d_fake, gap 恒≈0)
+                _edge_val = edge_item.item()
+                _real_val = realism_item.item()
                 _dR_val = _d_real_dstep.item()
                 _dF_val = _d_fake_dstep.item()
-                # v22: OCR准确率使用CaptchaResNet计算（恢复OCR监督）
+                # 日志用 CaptchaResNet 整串准确率
                 if ocr_model is not None:
                     _ocr_acc = ocr_net.ocr_accuracy(ocr_model, fake_imgs, labels)
                     _ocr_acc_v = _ocr_acc.item()
                 else:
                     _ocr_acc_v = 0.0
-                # v25: 字符级权重统计
                 _valid_ratio = ocr_valid_ratio
                 _ocr_w_mean = ocr_w_mean_v
-                # 阶段标签
                 phase = "WARM" if in_g_warmup else ("ADV_WARM" if in_adv_warmup else "JOINT")
                 print(
                     f"  [{phase}] Epoch {epoch:3d}/{args.epochs} "
@@ -1521,7 +1482,7 @@ def train(args):
                     f"G: {_g_val:.3f} "
                     f"Aux: {_aux_val:.3f} "
                     f"OCR[{ocr_ph}]: {_ocr_acc_v:.3f}(w={_ocr_w_mean:.3f},效{_valid_ratio:.0%}) "
-                    f"FM: {_fm_val:.3f}(λ={cur_fm_lambda:.1f}) "
+                    f"FM: {_fm_val:.3f}(λ={LAMBDA_FM:.1f}) "
                     f"Div: {_div_val:.4f} "
                     f"Edge: {_edge_val:.4f} "
                     f"Real: {_real_val:.4f} "
@@ -1539,7 +1500,7 @@ def train(args):
                     f"{' ADA:' + str(ada.p)[:5] if ada is not None else ''}"
                 )
 
-            # ─── 文件日志 (每 100 步, 比控制台更详细) ───
+            # ─── CSV 文件日志 ─────────────────────────
             if global_step % _FILE_LOG_INTERVAL == 0:
                 elapsed = time.time() - t_start
                 ips = global_step / elapsed if elapsed > 0 else 0
@@ -1547,30 +1508,29 @@ def train(args):
                 cur_lr_d_v = d_optim.param_groups[0]["lr"]
                 r1_v = r1_penalty_val.item() if isinstance(r1_penalty_val, torch.Tensor) else 0.0
                 r2_v = r2_penalty_val.item() if isinstance(r2_penalty_val, torch.Tensor) else 0.0
-                adv_l_v = get_adv_lambda(epoch, G_WARMUP_EPOCHS) if not in_g_warmup else 0.0
-                # v12: 日志修复 — v11 错误地写成 adv_l_v * get_fm_lambda() (预热期恒0)
-                # 实际训练中 FM 权重恒为 LAMBDA_FM (固定), 直接记录真实值
+                # FM 权重恒为 LAMBDA_FM, 直接记录真实值
                 fm_l_v = float(LAMBDA_FM)
-                # v6: gp_item 现在是 tensor, 安全提取
-                gp_v = gp_item.item() if isinstance(gp_item, torch.Tensor) else gp_item
-                # v6: 当前步的 Aux 准确率 (tensor→float, 仅在日志间隔 sync)
                 _step_acc_r = _acc_real.item() if isinstance(_acc_real, torch.Tensor) else _acc_real
                 _step_acc_f = _acc_fake.item() if isinstance(_acc_fake, torch.Tensor) else _acc_fake
-                # v6: 提取 tensor 值 (仅在日志间隔 sync)
-                # v12: 使用 D 训练步快照 (修复 v11 gap 恒≈0 的日志 bug)
                 _dR = _d_real_dstep.item()
                 _dF = _d_fake_dstep.item()
                 _dRE = d_real_ema.item()
                 _dFE = d_fake_ema.item()
+                _dlen = (float(adaptive_ocr.last_len_err.get("ddddocr", -1.0))
+                         if adaptive_ocr is not None else -1.0)
+                _plen = (float(adaptive_ocr.last_len_err.get("ppllocr", -1.0))
+                         if adaptive_ocr is not None else -1.0)
+                _aux_gap = (_perfect_fake.item() - dddd_acc_v) if dddd_acc_v >= 0 else -1.0
+                _ada_p = float(ada.p) if ada is not None else 0.0
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 _write_log_line(
                     log_file, ts, epoch, global_step, phase,
                     d_item.item(), g_item.item(), aux_item.item(),
                     fm_item.item(), fm_l_v, contrast_item.item(),
                     div_item.item(),
-                    edge_item.item(),    # v10
-                    realism_item.item(),  # v10
-                    r1_v, r2_v, gp_v,
+                    edge_item.item(),
+                    realism_item.item(),
+                    r1_v, r2_v,
                     _dR, _dF,
                     _dRE, _dFE,
                     d_grad_norm, g_grad_norm,
@@ -1584,52 +1544,64 @@ def train(args):
                     ocr_acc=float(ocr_acc_item),
                     dddd_acc=dddd_acc_v, ppll_acc=ppll_acc_v,
                     gap_ink=gap_ink_v,
+                    dddd_len_err=_dlen, ppll_len_err=_plen,
+                    len_fail_ratio=float(len_fail_ratio_v),
+                    aux_gap=_aux_gap, ada_p=_ada_p,
+                    struct_ce=float(struct_item), spatial_loss=float(spatial_item),
+                    column_loss=float(column_item),
                     ocr_phase=ocr_ph, ocr_ramp=ocr_ramp_v,
                 )
 
         # ─── 每个 epoch 结束 ────────────────────────────
-
-        # 平均损失 (v6: .item() 仅在 epoch 结束时 sync)
-        avg_g = (epoch_g_loss / max(epoch_batches, 1)).item()
-        avg_d = (epoch_d_loss / max(epoch_batches, 1)).item()
-        avg_aux = (epoch_aux_loss / max(epoch_batches, 1)).item()
-        avg_fm = (epoch_fm_loss / max(epoch_batches, 1)).item()
-        avg_ctr = (epoch_contrast_loss / max(epoch_batches, 1)).item()
-        avg_div = (epoch_div_loss / max(epoch_batches, 1)).item()
-        avg_edge = (epoch_edge_loss / max(epoch_batches, 1)).item()     # v10
-        avg_real = (epoch_realism_loss / max(epoch_batches, 1)).item()  # v10
-        avg_ocr = (epoch_ocr_loss / max(epoch_batches, 1)).item()       # v13
-        # v25: OCR 分量均值
-        avg_ocr_ce = (epoch_ocr_ce / max(epoch_batches, 1)).item()
-        avg_ocr_feat = (epoch_ocr_feat / max(epoch_batches, 1)).item()
-        avg_ocr_lambda = epoch_ocr_lambda / max(epoch_batches, 1)
-        avg_ocr_w = epoch_ocr_w_mean / max(epoch_batches, 1)
-        avg_ocr_valid = epoch_ocr_valid / max(epoch_batches, 1)
-        avg_ocr_acc = (epoch_ocr_acc / max(epoch_batches, 1)).item()   # v27: 统一CaptchaResNet语义
+        epoch_batches_safe = max(epoch_batches, 1)
+        avg_g = (epoch_g_loss / epoch_batches_safe).item()
+        avg_d = (epoch_d_loss / epoch_batches_safe).item()
+        avg_aux = (epoch_aux_loss / epoch_batches_safe).item()
+        avg_fm = (epoch_fm_loss / epoch_batches_safe).item()
+        avg_ctr = (epoch_contrast_loss / epoch_batches_safe).item()
+        avg_div = (epoch_div_loss / epoch_batches_safe).item()
+        avg_edge = (epoch_edge_loss / epoch_batches_safe).item()
+        avg_real = (epoch_realism_loss / epoch_batches_safe).item()
+        avg_ocr = (epoch_ocr_loss / epoch_batches_safe).item()
+        avg_ocr_ce = (epoch_ocr_ce / epoch_batches_safe).item()
+        avg_ocr_feat = (epoch_ocr_feat / epoch_batches_safe).item()
+        avg_ocr_lambda = epoch_ocr_lambda / epoch_batches_safe
+        avg_ocr_w = epoch_ocr_w_mean / epoch_batches_safe
+        avg_ocr_valid = epoch_ocr_valid / epoch_batches_safe
+        avg_ocr_acc = (epoch_ocr_acc / epoch_batches_safe).item()
         avg_dddd_acc = (epoch_dddd_acc / epoch_dddd_n) if epoch_dddd_n > 0 else -1.0
         avg_ppll_acc = (epoch_ppll_acc / epoch_ppll_n) if epoch_ppll_n > 0 else -1.0
-        avg_gap_ink = epoch_gap_ink / max(epoch_batches, 1)            # v27
-        # v5: 平均验证准确率
-        avg_acc_real = epoch_aux_acc_real / max(epoch_batches, 1)
-        avg_acc_fake = epoch_aux_acc_fake / max(epoch_batches, 1)
-        # v17: 平均整串正确率
-        avg_perfect_real = epoch_perfect_acc_real / max(epoch_batches, 1)
-        avg_perfect_fake = epoch_perfect_acc_fake / max(epoch_batches, 1)
+        avg_gap_ink = epoch_gap_ink / epoch_batches_safe
+        avg_acc_real = epoch_aux_acc_real / epoch_batches_safe
+        avg_acc_fake = epoch_aux_acc_fake / epoch_batches_safe
+        avg_perfect_real = epoch_perfect_acc_real / epoch_batches_safe
+        avg_perfect_fake = epoch_perfect_acc_fake / epoch_batches_safe
+        # v32: 新指标 / epoch 汇总的梯度与 R1/R2
+        avg_spatial = epoch_spatial / epoch_batches_safe
+        avg_struct = epoch_struct / epoch_batches_safe
+        avg_column = epoch_column / epoch_batches_safe
+        avg_len_fail = epoch_len_fail / max(epoch_len_fail_n, 1)
+        avg_dddd_len = (epoch_dddd_len / epoch_dddd_n) if epoch_dddd_n > 0 else -1.0
+        avg_ppll_len = (epoch_ppll_len / epoch_ppll_n) if epoch_ppll_n > 0 else -1.0
+        avg_aux_gap = (avg_perfect_fake - avg_dddd_acc) if avg_dddd_acc >= 0 else -1.0
+        avg_r1 = epoch_r1_t.item() / epoch_batches_safe
+        avg_r2 = epoch_r2_t.item() / epoch_batches_safe
+        avg_dgrad = epoch_dgrad_t.item() / epoch_batches_safe
+        avg_ggrad = epoch_ggrad_t.item() / epoch_batches_safe
+        ada_p_v = float(ada.p) if ada is not None else 0.0
 
-        # 阶梯 LR 更新
+        # 学习率调度
         g_scheduler.step()
         d_scheduler.step()
 
-        # 生成样例 (使用 EMA 模型 + 训练 G 对比)
+        # 样例生成 (EMA 模型 + 训练 G 对比)
         if epoch % args.sample_interval == 0 or epoch == 1:
-            # EMA 采样 (v5: 修复了 BN 统计量 Bug, 现在可信)
             save_sample(ema_g.ema_model, fixed_z, fixed_labels,
-                       epoch, global_step, output_dir, tag="ema")
-            # v5: 同时用训练 G 直接采样 (train mode, 使用 batch stats)
+                        epoch, global_step, output_dir, tag="ema")
             save_sample(G, fixed_z2, fixed_labels2,
-                       epoch, global_step, output_dir, tag="train")
+                        epoch, global_step, output_dir, tag="train")
 
-        # 保存模型 (含 EMA 状态)
+        # 模型保存 (含 EMA 与 scheduler 状态)
         if epoch % args.save_interval == 0 or epoch == 1:
             ckpt_path = output_dir / f"checkpoint_epoch_{epoch:03d}.pt"
             torch.save({
@@ -1640,62 +1612,102 @@ def train(args):
                 "g_optimizer_state_dict": g_optim.state_dict(),
                 "d_optimizer_state_dict": d_optim.state_dict(),
                 "ema_state_dict": ema_g.state_dict(),
-                "g_scheduler_state_dict": g_scheduler.state_dict(),   # v28
-                "d_scheduler_state_dict": d_scheduler.state_dict(),   # v28
+                "g_scheduler_state_dict": g_scheduler.state_dict(),
+                "d_scheduler_state_dict": d_scheduler.state_dict(),
+                "ada_p": ada_p_v,
+                "seed": int(getattr(args, "seed", SEED)),
+                "best_ratio_score": best_ratio_score,
+                "best_ratio_epoch": best_ratio_epoch,
             }, ckpt_path)
             print(f"  [SAVE] {ckpt_path.name}")
 
+        # v32: best ckpt = N-epoch 平滑外部比值 (不再用单 epoch 32 张 acc)
+        if adaptive_ocr is not None and avg_dddd_acc > 0 and avg_ppll_acc > 0:
+            best_hist.append((avg_dddd_acc, avg_ppll_acc))
+            if len(best_hist) >= best_smooth:
+                _md = sum(x[0] for x in best_hist) / len(best_hist)
+                _mp = sum(x[1] for x in best_hist) / len(best_hist)
+                _b = adaptive_ocr.base_accuracies
+                _score = (abs(_md / _b["ddddocr"] - 1.0)
+                          + abs(_mp / _b["ppllocr"] - 1.0))
+                if _score < best_ratio_score:
+                    best_ratio_score = _score
+                    best_ratio_epoch = epoch
+                    _best_path = output_dir / "checkpoint_best.pt"
+                    torch.save({
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "generator_state_dict": G.state_dict(),
+                        "discriminator_state_dict": D.state_dict(),
+                        "g_optimizer_state_dict": g_optim.state_dict(),
+                        "d_optimizer_state_dict": d_optim.state_dict(),
+                        "ema_state_dict": ema_g.state_dict(),
+                        "g_scheduler_state_dict": g_scheduler.state_dict(),
+                        "d_scheduler_state_dict": d_scheduler.state_dict(),
+                        "ada_p": ada_p_v,
+                        "seed": int(getattr(args, "seed", SEED)),
+                        "best_ratio_score": best_ratio_score,
+                        "best_ratio_epoch": best_ratio_epoch,
+                    }, _best_path)
+                    print(f"  [v32] 新 best ckpt: ep{epoch} "
+                          f"smoothed_score={_score:.4f} "
+                          f"(dddd={_md:.4f}, ppll={_mp:.4f}, "
+                          f"window={len(best_hist)}ep)")
+
         epoch_time = time.time() - epoch_start
         cur_lr = g_optim.param_groups[0]["lr"]
-        # v12: FM 权重实际恒为 LAMBDA_FM (修复 v11 cur_fm*cur_adv 的日志 bug)
-        cur_fm = float(LAMBDA_FM)
         cur_adv = get_adv_lambda(epoch, G_WARMUP_EPOCHS) if not in_g_warmup else 0.0
         phase = "WARM" if in_g_warmup else ("ADV_WARM" if in_adv_warmup else "JOINT")
-        
-        # v19: 获取自适应OCR状态
+
         ocr_status = ""
         if adaptive_ocr is not None:
             ocr_status = f" | OCR权重={adaptive_ocr.current_weight:.4f}"
-        
+
         print(
             f"  [{phase}] —— Epoch {epoch:3d} 完成 "
             f"| D={avg_d:.3f} G={avg_g:.3f} Aux={avg_aux:.3f} "
-            f"FM={avg_fm:.3f}(λ={cur_fm:.2f}) Div={avg_div:.4f} "
+            f"FM={avg_fm:.3f}(λ={float(LAMBDA_FM):.2f}) Div={avg_div:.4f} "
             f"Edge={avg_edge:.4f} Real={avg_real:.4f} "
             f"OCR[{ocr_ph}]={avg_ocr:.4f}(CE={avg_ocr_ce:.3f},w={avg_ocr_w:.3f},λ={avg_ocr_lambda:.2f}) "
             f"Adv={cur_adv:.2f} Ctr={avg_ctr:.3f} "
             f"AccR={avg_acc_real:.3f} AccF={avg_acc_fake:.3f} "
             f"PerfR={avg_perfect_real:.3f} PerfF={avg_perfect_fake:.3f} "
+            f"Spatial={avg_spatial:.4f} Col={avg_column:.4f} Struct={avg_struct:.4f} LenFail={avg_len_fail:.1%} "
+            f"DauxGap={avg_aux_gap:+.3f} "
             f"dR_ema={d_real_ema.item():+.2f} dF_ema={d_fake_ema.item():+.2f} "
             f"LR={cur_lr:.2e}{ocr_status} | 耗时 {epoch_time:.0f}s ——\n"
         )
 
-        # ─── 文件日志: epoch 总结 (每个 epoch 写入) ───
+        # CSV: epoch 汇总行
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _write_log_line(
             log_file, ts, epoch, global_step, f"{phase}_EPOCH",
             avg_d, avg_g, avg_aux,
-            avg_fm, cur_fm, avg_ctr, avg_div,
-            avg_edge,  # v10
-            avg_real,  # v10
-            0.0, 0.0, 0.0,  # r1, r2, gp all zero for epoch summary
+            avg_fm, float(LAMBDA_FM), avg_ctr, avg_div,
+            avg_edge,
+            avg_real,
+            avg_r1, avg_r2,
             d_real_ema.item(), d_fake_ema.item(),
             d_real_ema.item(), d_fake_ema.item(),
-            0.0, 0.0,
+            avg_dgrad, avg_ggrad,
             cur_lr, cur_lr,
             avg_acc_real, avg_acc_fake,
-            avg_perfect_real, avg_perfect_fake,  # v17: 整串正确率
+            avg_perfect_real, avg_perfect_fake,
             0.0, 0,
             ocr_loss=avg_ocr, ocr_ce=avg_ocr_ce,
             ocr_feat=avg_ocr_feat, ocr_lambda=avg_ocr_lambda,
             ocr_w_mean=avg_ocr_w, ocr_valid_ratio=avg_ocr_valid,
-            ocr_acc=avg_ocr_acc,                # v27: 统一为CaptchaResNet整串acc
+            ocr_acc=avg_ocr_acc,
             dddd_acc=avg_dddd_acc, ppll_acc=avg_ppll_acc,
             gap_ink=avg_gap_ink,
+            dddd_len_err=avg_dddd_len, ppll_len_err=avg_ppll_len,
+            len_fail_ratio=avg_len_fail,
+            aux_gap=avg_aux_gap, ada_p=ada_p_v,
+            struct_ce=avg_struct, spatial_loss=avg_spatial, column_loss=avg_column,
             ocr_phase=ocr_ph, ocr_ramp=ocr_ramp_v,
         )
 
-        # 清理缓存 (v6: 降低频率, 每 10 epoch 一次, 避免频繁内存碎片整理)
+        # 清理缓存 (降低频率, 避免频繁内存碎片整理)
         if epoch % 10 == 0:
             empty_cache()
 
@@ -1707,10 +1719,9 @@ def train(args):
     print(f"  日志文件:    {(output_dir / 'training_log.csv').resolve()}")
     print(f"{'='*60}")
 
-    # 关闭文件日志
     log_file.close()
 
-    # 保存最终模型 (EMA 版本)
+    # 保存最终模型
     final_ckpt = output_dir / f"checkpoint_epoch_{args.epochs:03d}.pt"
     torch.save({
         "epoch": args.epochs,
@@ -1720,11 +1731,14 @@ def train(args):
         "g_optimizer_state_dict": g_optim.state_dict(),
         "d_optimizer_state_dict": d_optim.state_dict(),
         "ema_state_dict": ema_g.state_dict(),
-        "g_scheduler_state_dict": g_scheduler.state_dict(),   # v28
-        "d_scheduler_state_dict": d_scheduler.state_dict(),   # v28
+        "g_scheduler_state_dict": g_scheduler.state_dict(),
+        "d_scheduler_state_dict": d_scheduler.state_dict(),
+        "ada_p": float(ada.p) if ada is not None else 0.0,
+        "seed": int(getattr(args, "seed", SEED)),
+        "best_ratio_score": best_ratio_score,
+        "best_ratio_epoch": best_ratio_epoch,
     }, final_ckpt)
     print(f"  [SAVE] {final_ckpt.name}")
-    # 使用 EMA 模型生成最终样例
     save_sample(ema_g.ema_model, fixed_z, fixed_labels, args.epochs, global_step, output_dir)
 
 
@@ -1761,38 +1775,49 @@ def parse_args():
     parser.add_argument("--log-interval", type=int, default=LOG_INTERVAL,
                         help=f"日志打印间隔 (步数, 默认: {LOG_INTERVAL})")
     parser.add_argument("--sample-interval", type=int, default=1,
-                        help=f"采样间隔 (epoch, 默认: 1)")
+                        help="采样间隔 (epoch, 默认: 1)")
     parser.add_argument("--save-interval", type=int, default=MODEL_SAVE_INTERVAL,
                         help=f"模型保存间隔 (epoch, 默认: {MODEL_SAVE_INTERVAL})")
-    # v14: 新增参数
     parser.add_argument("--use-cosine-lr", action="store_true", default=USE_COSINE_LR,
-                        help="使用Cosine Annealing学习率调度器")
+                        help="使用 Cosine Annealing 学习率调度器")
     parser.add_argument("--lr-min", type=float, default=LR_MIN,
-                        help=f"Cosine调度器最小学习率 (默认: {LR_MIN})")
+                        help=f"Cosine 调度器最小学习率 (默认: {LR_MIN})")
     parser.add_argument("--edge-loss-min", type=float, default=EDGE_LOSS_MIN,
-                        help=f"Edge Loss下限, 低于此值时权重翻倍 (默认: {EDGE_LOSS_MIN})")
-    # v26: OCR课程学习
+                        help=f"Edge Loss 下限, 低于此值时权重翻倍 (默认: {EDGE_LOSS_MIN})")
     parser.add_argument("--curriculum-epochs", type=int, default=CURRICULUM_EPOCHS,
                         help=f"OCR课程学习 Phase A (仅CaptchaResNet强引导) 轮数 (默认: {CURRICULUM_EPOCHS})")
     parser.add_argument("--curriculum-ramp", type=int, default=CURRICULUM_RAMP,
                         help=f"OCR课程学习 A→B 切换期轮数 (默认: {CURRICULUM_RAMP}, 建议2-5)")
     parser.add_argument("--no-curriculum", action="store_true", default=not USE_CURRICULUM,
-                        help="禁用OCR课程学习, 全程使用 v25 三OCR方案")
-    # v27: Phase C 混淆软目标 (机器干扰)
+                        help="禁用OCR课程学习, 全程使用三OCR方案")
     parser.add_argument("--phase-c-epoch", type=int, default=PHASE_C_EPOCHS,
                         help=f"Phase C 混淆软目标起始轮 (默认: {PHASE_C_EPOCHS}, 0=禁用)")
     parser.add_argument("--phase-c-ramp", type=int, default=PHASE_C_RAMP,
                         help=f"Phase C ε 线性爬升轮数 (默认: {PHASE_C_RAMP})")
-    # v28: 反粘连 gap hinge (默认关闭, 回归v26视觉)
     parser.add_argument("--lambda-gap", type=float, default=LAMBDA_GAP,
-                        help=f"反粘连 gap hinge 损失权重 (v28: 0=关闭, 默认 {LAMBDA_GAP})")
+                        help=f"反粘连 gap hinge 损失权重 (0=关闭, 默认 {LAMBDA_GAP})")
+    # v32
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help=f"随机种子 (默认: {SEED})")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="启用 cudnn deterministic (更可复现, 可能略慢)")
+    parser.add_argument("--lambda-spatial", type=float, default=LAMBDA_SPATIAL,
+                        help=f"OCR 空间矩损失权重 (默认: {LAMBDA_SPATIAL}, 0=关闭)")
+    parser.add_argument("--lambda-column", type=float, default=LAMBDA_COLUMN,
+                        help=f"列墨迹剖面损失权重 (默认: {LAMBDA_COLUMN}, 0=关闭)")
+    parser.add_argument("--len-fail-lambda", type=float, default=LEN_FAIL_LAMBDA,
+                        help=f"长度结构 CE 权重 (默认: {LEN_FAIL_LAMBDA})")
+    parser.add_argument("--daux-fake-weight", type=float, default=D_AUX_FAKE_WEIGHT,
+                        help=f"D aux 的 fake 权重 (默认: {D_AUX_FAKE_WEIGHT}; 1.0=v28)")
+    parser.add_argument("--best-smooth", type=int, default=BEST_SMOOTH_EPOCHS,
+                        help=f"best ckpt 平滑窗口 (默认: {BEST_SMOOTH_EPOCHS} ep)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # 如果命令行指定了路径，覆盖 config 默认值
+    # 命令行路径覆盖 config 默认值
     if args.data_dir:
         import data_loader
         data_loader.DATA_DIR = Path(args.data_dir)
@@ -1800,9 +1825,7 @@ def main():
         import utils as utils_mod
         utils_mod.OUTPUT_DIR = Path(args.output_dir)
 
-    # 设置矩阵乘法精度
     setup_matmul_precision()
-    # v6: NPU 性能环境变量提示
     print_npu_env_hints()
 
     train(args)

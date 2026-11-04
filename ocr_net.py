@@ -6,9 +6,12 @@
 import torch
 import torch.nn as nn
 
+from pathlib import Path
+
 from config import NUM_CLASSES, CAPTCHA_LENGTH, IMG_HEIGHT, IMG_WIDTH
 
-OCR_WEIGHTS = "OCR/best_captcha_resnet.pth"
+# dev/ocr_net.py -> dev/OCR/best_captcha_resnet.pth
+OCR_WEIGHTS = str(Path(__file__).resolve().parent / "OCR" / "best_captcha_resnet.pth")
 
 
 class ResBlock(nn.Module):
@@ -104,12 +107,37 @@ def ocr_feature_loss(feat_fake, feat_real):
         feat_fake.mean(dim=(2, 3)), feat_real.mean(dim=(2, 3)).detach())
 
 
+def ocr_spatial_loss(feat_fake, feat_real):
+    """v32: 空间矩匹配 — 通道空间 std + 行/列激活剖面.
+
+    实测 (v28/v31.1 ep400, 128 张):
+      - Gram 归一化损失 0.00026/0.00028, 几乎无区分度, 已弃用;
+      - 本损失 0.034/0.042, v31.1 高约 24%, 能区分"涂鸦/粘连"。
+    旧 ocr_feature_loss 只匹配 channel 均值; 这里补上空间分布:
+      l_std: 每通道空间 std (笔画/纹理强度)
+      l_col: 批次平均的列激活剖面 (字符横向占用)
+      l_row: 批次平均的行激活剖面 (字符纵向分布)
+    feat: (B,C,H,W); 返回标量.
+    """
+    rf = feat_real.detach()
+    l_std = torch.nn.functional.l1_loss(
+        feat_fake.std(dim=(2, 3)).mean(dim=0),
+        rf.std(dim=(2, 3)).mean(dim=0))
+    l_col = torch.nn.functional.l1_loss(
+        feat_fake.mean(dim=0).mean(dim=0),
+        rf.mean(dim=0).mean(dim=0))
+    l_row = torch.nn.functional.l1_loss(
+        feat_fake.mean(dim=0).mean(dim=2),
+        rf.mean(dim=0).mean(dim=2))
+    return l_std + l_col + l_row
+
+
 def ocr_accuracy(model, images, labels):
     """整串准确率 (0-dim tensor). 4个字符全部正确才算对."""
     with torch.no_grad():
         logits = model(images)
         preds = logits.argmax(-1)  # (B, 4)
-        return (preds == labels).all(dim=1).float().mean()  # ✅ 整串正确率
+        return (preds == labels).all(dim=1).float().mean()
 
 
 if __name__ == "__main__":
@@ -146,8 +174,12 @@ if __name__ == "__main__":
     # 2. 当前生成图准确率
     from models import Generator
     from utils import load_model
+    from config import OUTPUT_DIR
+    ckpts = sorted(Path(OUTPUT_DIR).glob("checkpoint_epoch_*.pt"))
+    if not ckpts:
+        raise FileNotFoundError(f"未找到 checkpoint: {OUTPUT_DIR}/checkpoint_epoch_*.pt")
     G = Generator().to(DEVICE).eval()
-    load_model(Path('output/checkpoint_epoch_300.pt'), G, None, device=DEVICE)
+    load_model(ckpts[-1], G, None, device=DEVICE)
     torch.manual_seed(7)
     gok = 0
     gtot = 0

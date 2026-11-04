@@ -1,30 +1,30 @@
 """
-自适应OCR监督方案 (v25) - 字符级证据权重表
+自适应 OCR 监督 —— 字符级证据权重表
 
-核心思想 (基于 v20-v24 训练诊断):
-- 三个OCR (CaptchaResNet/过拟合, ddddocr+ppllocr/第三方无泄露) 按字符位给证据状态
-- 96格主表 (C六态 × D四态 × P四态) 给逐位权重, 全未中地板 W_FLOOR=0.08 破除
-  v24 死锁: (F,F,F)→0 → 有效0% → 无梯度 → 永远读不出
-- 快速路径子表: 仅C可用时按C状态查表 (每步零额外成本)
-- 修正因子: M_len(串长≠4) / M_cheat(高置信独苗) / M_cons(D==P错读共识)
+核心思想
+  三个 OCR (CaptchaResNet 可能过拟合 / ddddocr 与 ppllocr 为第三方无泄露)
+  按字符位给出证据状态, 通过 96 格主表 (C 六态 × D 四态 × P 四态) 计算
+  逐位权重; 全部未命中时保留地板权重 W_FLOOR, 避免"无梯度 → 永远读不出"。
+  另提供仅 C 可用的快速路径子表 (每步零额外成本) 与三个修正因子:
+  M_len(串长≠4) / M_cheat(高置信独苗) / M_cons(D==P 错读共识)。
 
-状态定义 (优先级: hit > near > peer > miss):
-  C (CaptchaResNet, 有logits/置信度):
-    c_strong  argmax=label 且 p≥C_CONF_HI(0.90)
-    c_hit     argmax=label 且 C_CONF_LO(0.50)≤p<0.90
-    c_weak    argmax=label 且 p<0.50
-    c_near    argmax≠label 但 [label为rank-2且p≥0.25 或 (pred,label)∈混淆对]
-    c_peer    argmax = D或P该位字符 且 ≠label (共识错读)
+状态定义 (优先级: hit > near > peer > miss)
+  C (CaptchaResNet, 有 logits/置信度):
+    c_strong  argmax=label 且 p≥C_CONF_HI
+    c_hit     argmax=label 且 C_CONF_LO≤p<C_CONF_HI
+    c_weak    argmax=label 且 p<C_CONF_LO
+    c_near    argmax≠label 但 (label 为 rank-2 且 p≥C_RANK2_PROB) 或为混淆对
+    c_peer    argmax = D 或 P 该位字符 且 ≠label (共识错读)
     c_miss    其他
-  D/P (字符串OCR):
+  D/P (字符串 OCR):
     hit   对齐字符=label
-    near  (字符,label)∈混淆对 (半信用, 5组: 0/O 1/I 2/Z 5/S 8/B)
-    peer  与另一第三方该位同字 且 ≠label (共识错读=可读但内容错)
-    miss  其他; 长度≠4无对齐位置按"无证据"并入miss (不虚构证据)
+    near  (字符, label) 为实证混淆对
+    peer  与另一第三方该位同字 且 ≠label (共识错读)
+    miss  其他; 串长≠4 无对齐位置按"无证据"并入 miss (不虚构证据)
 
-权重合成:
+权重合成
     w = W_MASTER[c,d,p] × M_len × M_cheat
-    若 D==P整串一致且≠label: w = min(w × M_CONS, M_CONS_CAP)
+    若 D==P 整串一致且≠label: w = min(w × M_CONS, M_CONS_CAP)
     最终 w = clamp(w, W_FLOOR, 1.0)
 """
 import torch
@@ -32,24 +32,24 @@ from config import (
     CHARS, CAPTCHA_LENGTH,
     W_FLOOR, C_CONF_HI, C_CONF_LO, C_RANK2_PROB,
     M_LEN, M_LEN_MIN, M_CHEAT, M_CONS, M_CONS_CAP,
+    LEN_FAIL_SKIP_PENALTY, LEN_FAIL_MIN_WEIGHT,
     CONFUSABLE_PAIRS,
 )
 
 
-# ============== OCR基准准确率 ==============
-# v27: 全量实测 (ocr_error_stats_*.txt, 149,886图) — 旧值0.748/0.629恰比实测低5pp,
-# 欺骗阈值(基准+5%)压在真实准确率上 → G达到真实级可读即被判欺骗(假阳性陷阱),
-# 会在 G 最成功时撤掉 OCR 监督。修正后阈值=真实+5% 自动成为"机器识别太高"守卫。
+# ============== OCR 基准准确率 ==============
+# 全量实测值 (真实数据 149,886 张, 双 OCR 整图准确率)。
+# 欺骗阈值 = 基准 + CHEAT_THRESHOLD, 即"机器识别率明显高于真实数据"时判定欺骗。
 OCR_BASELINE = {
-    "ddddocr": 0.7983,      # 79.83% (全量实测 119648/149886)
-    "ppllocr": 0.6787,      # 67.87% (全量实测 101721/149886)
-    "captcha_resnet": 0.90, # 90% (训练集训练，人为降低基准)
+    "ddddocr": 0.7983,      # 79.83%
+    "ppllocr": 0.6787,      # 67.87%
+    "captcha_resnet": 0.90, # 人为降低基准 (该模型在训练集上训练, 易过拟合)
 }
 
 # ============== 自适应配置 ==============
 CHEAT_THRESHOLD = 0.05     # 超过基准+5%视为欺骗
-OCR_WEIGHT_INITIAL = 0.15  # 初始OCR权重 (外层λ, 内层w另计)
-OCR_WEIGHT_MIN = 0.02      # 最低OCR权重
+OCR_WEIGHT_INITIAL = 0.15  # 初始 OCR 外层权重
+OCR_WEIGHT_MIN = 0.02      # 最低外层权重
 OCR_WEIGHT_DECAY = 0.7     # 检测到欺骗时的衰减因子
 OCR_WEIGHT_RECOVER = 1.02  # 未检测到欺骗时的恢复因子
 
@@ -65,11 +65,11 @@ C_SYMBOL = {C_STRONG: "C++", C_HIT: "C+", C_WEAK: "C±",
             C_NEAR: "C~", C_PEER: "C!", C_MISS: "C-"}
 DP_SYMBOL = {DP_HIT: "+", DP_NEAR: "~", DP_PEER: "!", DP_MISS: "-"}
 
-# ============== 96格主表 W_MASTER[c_state][d_state][p_state] ==============
-# 行=D状态, 列=P状态, 块=C状态; 合成原则:
-#   s = e_C×corr + e_D + e_P (corr=1.0有第三方证据/0.3 C独苗)
-#   7档塑形 + D!P!双共识错读+0.08 (可读性最强反证, CE"改内容"方向被验证)
-#   C独苗列(-,-)为欺骗嫌疑低权列 (0.20/0.16/0.12/0.08)
+# ============== 96 格主表 W_MASTER[c_state][d_state][p_state] ==============
+# 合成原则:
+#   s = e_C×corr + e_D + e_P (corr=1.0 有第三方证据 / 0.3 C 独苗)
+#   7 档塑形 + D!P! 双共识错读 +0.08 (可读性最强反证)
+#   C 独苗列 (-,-) 为欺骗嫌疑低权列 (0.20/0.16/0.12/0.08)
 W_MASTER = {
     C_STRONG: {
         DP_HIT:  {DP_HIT: 1.00, DP_NEAR: 0.90, DP_PEER: 0.95, DP_MISS: 0.78},
@@ -109,13 +109,13 @@ W_MASTER = {
     },
 }
 
-# ============== 快速路径子表 (仅C可用, 即主表 D- P- 列) ==============
+# ============== 快速路径子表 (仅 C 可用, 即主表 D- P- 列) ==============
 W_FAST = {
     C_STRONG: 0.20,
     C_HIT: 0.16,
     C_WEAK: 0.12,
     C_NEAR: W_FLOOR,
-    C_PEER: W_FLOOR,   # 无D/P无法判定peer, 不虚构证据
+    C_PEER: W_FLOOR,   # 无 D/P 无法判定 peer, 不虚构证据
     C_MISS: W_FLOOR,
 }
 
@@ -131,7 +131,7 @@ def _is_confusable(a, b):
 
 
 def build_confusion_matrix(device=None):
-    """36×36 布尔矩阵: CONF_MAT[i,j]=CHARS[i]与CHARS[j]互为混淆对 (i≠j)"""
+    """36×36 布尔矩阵: CONF_MAT[i,j]=CHARS[i] 与 CHARS[j] 互为混淆对 (i≠j)"""
     n = len(CHARS)
     mat = torch.zeros(n, n, dtype=torch.bool, device=device)
     for i, a in enumerate(CHARS):
@@ -143,9 +143,9 @@ def build_confusion_matrix(device=None):
 
 def align_pred(pred: str, label: str):
     """
-    字符串OCR输出对齐到标签位.
-    串长==4: 直接位对齐; 否则位移 o∈[-2..2] 循环对齐取匹配数最多者.
-    对不上的位置记 None (丢失=无证据).
+    字符串 OCR 输出对齐到标签位:
+    串长==4 时直接位对齐; 否则在偏移 o∈[-2..2] 内取匹配数最多的循环对齐。
+    对不上的位置记 None (丢失=无证据)。
     Returns: (chars: list[str|None] 长度=CAPTCHA_LENGTH, len_ok: bool)
     """
     n = len(label)
@@ -171,7 +171,7 @@ def align_pred(pred: str, label: str):
 
 
 def dp_state(my_char, label_char, peer_char):
-    """单个第三方OCR的字符位状态. 优先级: hit > near > peer > miss"""
+    """单个第三方 OCR 的字符位状态. 优先级: hit > near > peer > miss"""
     if my_char is None:
         return DP_MISS          # 丢失=无证据, 不虚构
     if my_char == label_char:
@@ -186,8 +186,8 @@ def dp_state(my_char, label_char, peer_char):
 def c_state_from_pred(pred_char, label_char, conf, label_rank, p_true,
                       d_char=None, p_char=None):
     """
-    C 的字符位状态 (标量版, 供测试/离线分析).
-    label_rank: label概率在36类中的排名 (1=最高). 优先级: hit > near > peer > miss
+    C 的字符位状态 (标量版, 供离线分析/测试)。
+    label_rank: label 概率在 36 类中的排名 (1=最高)。
     """
     if pred_char == label_char:
         if conf >= C_CONF_HI:
@@ -211,15 +211,22 @@ def lookup_weight(c, d, p):
 
 def apply_multipliers(w, d_state, p_state, c_state, conf,
                       d_len_ok, p_len_ok, consensus_wrong,
-                      phase_c=False, d_garbage=False, p_garbage=False):
+                      phase_c=False, d_garbage=False, p_garbage=False,
+                      len_fail=False):
     """
     样本级/位级修正因子:
-      M_len  : D或P串长≠4 → ×0.85/个, 叠加下限 M_LEN_MIN
-      M_cheat: C∈{strong,hit} 且 p≥0.90 且 D/P均未命中 → ×0.50 (高置信独苗=对抗签名)
-               v27 Phase C: 混淆对内miss是目标态(机器干扰), 仅越界垃圾预测
-               (读成 @ / 等非36类字符) 才视为欺骗签名
-      M_cons : D==P整串一致且≠label → ×1.10, 终值cap M_CONS_CAP
+      M_len  : D 或 P 串长≠4 → ×0.85/个, 叠加下限 M_LEN_MIN
+      M_cheat: C 强命中且 p 高, 而 D/P 均未命中 → ×0.50 (高置信独苗=对抗签名)
+               Phase C 混淆阶段: 混淆对内 miss 是目标态, 仅越界垃圾预测
+               (读成 36 类外字符) 才视为欺骗签名
+      M_cons : D==P 整串一致且≠label → ×1.10, 终值 cap M_CONS_CAP
+      v32 len_fail: 第三方串长≠4 视为结构失败, 跳过 M_LEN/M_CHEAT/M_CONS,
+               只保留权重下限 LEN_FAIL_MIN_WEIGHT; 主梯度由 train.py 的
+               独立 struct CE 提供 (旧逻辑会把粘连样本压到 0.08 地板).
     """
+    if len_fail and LEN_FAIL_SKIP_PENALTY:
+        return max(min(w, 1.0), W_FLOOR, LEN_FAIL_MIN_WEIGHT)
+
     m = 1.0
     if not d_len_ok:
         m *= M_LEN
@@ -240,29 +247,25 @@ def apply_multipliers(w, d_state, p_state, c_state, conf,
 
 
 class MultiOCRAdaptive:
-    """
-    字符级证据权重表 + 自适应外层λ (v25)
-    """
+    """字符级证据权重表 + 自适应外层权重 λ"""
 
     def __init__(self, device, load_third_party=True):
         """
         Args:
             device: 设备
-            load_third_party: v26课程学习 — False=仅CaptchaResNet (Phase A,
-                省第三方OCR的CPU评估), 之后可调 load_third_party() 幂等补载
+            load_third_party: 课程学习 Phase A 时可设 False 仅加载 CaptchaResNet
+                (节省第三方 OCR 的 CPU 评估开销), 之后调用 load_third_party()
+                幂等补载。
         """
         self.device = device
 
-        # 加载OCR模型
+        # 加载 OCR 模型
         self.ocr_models = {}
         self._third_party_loaded = False
         self._load_captcha_resnet()
 
-        # 基准准确率
         self.base_accuracies = OCR_BASELINE.copy()
         self.cheat_threshold = CHEAT_THRESHOLD
-
-        # 当前权重（自适应调整）
         self.current_weight = OCR_WEIGHT_INITIAL
 
         # 统计
@@ -272,8 +275,12 @@ class MultiOCRAdaptive:
         # 历史记录
         self.weight_history = [OCR_WEIGHT_INITIAL]
         self.accuracy_history = {name: [] for name in self.ocr_models}
+        # v32: 最近一次第三方 OCR 的长度错误率 (整图口径, 供 CSV/epoch 汇总)
+        self.last_len_err = {name: -1.0 for name in self.ocr_models}
+        # v32: 检查级 EMA 长度错误率, 供"是否超过真实目标"门控 (decay 0.9)
+        self.ema_len_err = {name: -1.0 for name in self.ocr_models}
 
-        # v25: 状态组合统计 (全表样本) + 快速路径C态统计
+        # 状态组合统计 (全表样本) + 快速路径 C 态统计
         self.combo_counts = {}
         self.fast_c_counts = {}
         self.total_samples = 0
@@ -281,14 +288,14 @@ class MultiOCRAdaptive:
         self.w_sum = 0.0
         self.valid_sum = 0.0
 
-        # 36×36 混淆矩阵 (C状态判定用)
+        # 36×36 混淆矩阵 (C 状态判定用)
         self._conf_mat = build_confusion_matrix(device=device)
 
         if load_third_party:
             self.load_third_party()
 
     def _load_captcha_resnet(self):
-        """加载 CaptchaResNet (项目内置, OCR监督 + C状态判定)"""
+        """加载 CaptchaResNet (项目内置, OCR 监督 + C 状态判定)"""
         try:
             import ocr_net
             captcha_resnet = ocr_net.load_ocr(device=self.device, freeze=True)
@@ -298,14 +305,10 @@ class MultiOCRAdaptive:
             print(f"  [OCR] 加载 CaptchaResNet 失败: {e}")
 
     def load_third_party(self):
-        """
-        v26: 惰性加载 ddddocr+ppllocr (幂等).
-        Phase A 不加载 (省每100step的秒级CPU评估), Ramp 起点调用.
-        """
+        """惰性加载 ddddocr + ppllocr (幂等)"""
         if self._third_party_loaded:
             return
 
-        # ddddocr (第三方，无泄露)
         try:
             import ddddocr
             self.ocr_models['ddddocr'] = ddddocr.DdddOcr(show_ad=False)
@@ -313,7 +316,6 @@ class MultiOCRAdaptive:
         except Exception as e:
             print(f"  [OCR] 加载 ddddocr 失败: {e}")
 
-        # ppllocr (第三方，无泄露)
         try:
             from ppllocr import OCR
             self.ocr_models['ppllocr'] = OCR()
@@ -326,36 +328,43 @@ class MultiOCRAdaptive:
         for name in self.ocr_models:
             self.cheat_counts.setdefault(name, 0)
             self.accuracy_history.setdefault(name, [])
+            self.last_len_err.setdefault(name, -1.0)
+            self.ema_len_err.setdefault(name, -1.0)
         print(f"  [OCR] 总共加载 {len(self.ocr_models)} 个OCR模型")
 
     # ─────────────────────────────────────────────────────
-    #  v25: 字符级权重计算
+    #  字符级权重计算
     # ─────────────────────────────────────────────────────
     @torch.no_grad()
     def compute_char_weights(self, generated_images, labels,
                              ocr_logits=None, max_samples=None,
-                             phase_c=False):
+                             phase_c=False, len_apply=None,
+                             pair_sets=None, pair_from="ppll"):
         """
-        计算每个生成样本每个字符位的证据权重.
+        计算每个生成样本每个字符位的证据权重。
 
         Args:
-            generated_images: (B,1,H,W) tanh[-1,1]
-            labels: (B,CAPTCHA_LENGTH) 类索引
-            ocr_logits: 可选, CaptchaResNet logits (B,4,36), 避免重复前向
-            max_samples: None=全部走三OCR全表; 0=全部仅快速路径(C only);
-                         N>0=随机N张走全表, 其余快速路径
-            phase_c: v27 机器干扰阶段 — 混淆对内 NEAR 视为目标态 (映射为 HIT),
-                     M_cheat 仅罚越界垃圾预测
+            ...
+            len_apply: v32 (bool_d, bool_p), 是否把该 OCR 的长度错误视为
+                     结构失败; None=两者都算. train.py 按真实长度目标门控.
+            pair_sets: v2 可选 {true_char: set(wrong_chars)}; 用于返回
+                     第三方 OCR 命中"头部超额对"的 pair_mask (不改权重).
+            pair_from: ppll / dddd / both, 哪个 OCR 的预测触发 pair_mask.
 
         Returns:
             char_weights: (B, CAPTCHA_LENGTH) tensor on device
-            info: dict(w_mean, valid_ratio, n_full, n_fast)
+            info: dict(w_mean, valid_ratio, n_full, n_fast, len_fail_mask,
+                       pair_mask, ...)
         """
         from config import OCR_VALID_THR, NUM_CLASSES
+        if len_apply is None:
+            apply_d, apply_p = True, True
+        else:
+            apply_d, apply_p = bool(len_apply[0]), bool(len_apply[1])
         B = generated_images.size(0)
         dev = generated_images.device
 
-        # ── 1. C 状态 (每步都算, GPU向量化) ──
+        # ── 1. C 状态 (每步都算, GPU 向量化) ──
         cap = self.ocr_models.get('captcha_resnet')
         if ocr_logits is None:
             ocr_logits = cap(generated_images)
@@ -364,13 +373,12 @@ class MultiOCRAdaptive:
         pred_idx = probs.argmax(-1)                             # (B,4)
         conf = probs.max(-1).values                             # (B,4)
         p_true = probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
-        # label概率排名 (1=最高)
+        # label 概率排名 (1=最高)
         label_rank = (probs > p_true.unsqueeze(-1)).sum(-1) + 1  # (B,4)
         near_mat = self._conf_mat[pred_idx, labels]              # 混淆对 (B,4)
         near_mask = near_mat | ((label_rank == 2) & (p_true >= C_RANK2_PROB))
         hit_mask = pred_idx == labels
 
-        # C 字符/标签字符 (peer判定用)
         label_chars = [[CHARS[int(t)] for t in row] for row in labels.cpu().tolist()]
         pred_chars = [[CHARS[int(t)] for t in row] for row in pred_idx.cpu().tolist()]
 
@@ -406,6 +414,8 @@ class MultiOCRAdaptive:
 
         # ── 4. 逐位查表 ──
         char_w = torch.zeros(B, CAPTCHA_LENGTH, dtype=torch.float32, device=dev)
+        len_fail_mask = torch.zeros(B, dtype=torch.bool, device=dev)
+        pair_mask = torch.zeros(B, CAPTCHA_LENGTH, dtype=torch.bool, device=dev)
         for i in range(B):
             label_str = ''.join(label_chars[i])
 
@@ -420,12 +430,28 @@ class MultiOCRAdaptive:
                                      else ([None] * CAPTCHA_LENGTH, True))
                 consensus_wrong = (has_d and has_p and bool(d_raw)
                                    and d_raw == p_raw and d_raw != label_str)
-                # v27 Phase C: 越界垃圾预测判定 (含非36类字符 → M_cheat 依据)
+                # v32: 第三方串长≠4 = 结构失败 (粘连/断字), 不能当作"证据不足"降权
+                # 但只在 train.py 的门控允许该 OCR 时才算 (见 len_apply)
+                len_fail = bool((apply_d and has_d and not d_len_ok)
+                                or (apply_p and has_p and not p_len_ok))
+                len_fail_mask[i] = len_fail
+                # 越界垃圾预测判定 (含非 36 类字符 → M_cheat 依据)
                 d_garbage = has_d and bool(d_raw) and any(c not in CHARS for c in d_raw)
                 p_garbage = has_p and bool(p_raw) and any(c not in CHARS for c in p_raw)
                 for j in range(CAPTCHA_LENGTH):
                     lc = label_chars[i][j]
                     pc = pred_chars[i][j]
+                    # v2: 第三方 OCR 命中头部超额对 (true->wrong) 的位
+                    if pair_sets is not None:
+                        wrongs = []
+                        if pair_from in ("ppll", "both") and p_chars[j] is not None:
+                            wrongs.append(p_chars[j])
+                        if pair_from in ("dddd", "both") and d_chars[j] is not None:
+                            wrongs.append(d_chars[j])
+                        for wc in wrongs:
+                            if wc != lc and wc in pair_sets.get(lc, ()):
+                                pair_mask[i, j] = True
+                                break
                     d_state = dp_state(d_chars[j], lc, p_chars[j]) if has_d else DP_MISS
                     p_state = dp_state(p_chars[j], lc, d_chars[j]) if has_p else DP_MISS
                     # C 状态
@@ -456,13 +482,14 @@ class MultiOCRAdaptive:
                     w = apply_multipliers(
                         w, d_state, p_state, cs, float(conf[i, j]),
                         d_len_ok, p_len_ok, consensus_wrong,
-                        phase_c=phase_c, d_garbage=d_garbage, p_garbage=p_garbage)
+                        phase_c=phase_c, d_garbage=d_garbage, p_garbage=p_garbage,
+                        len_fail=len_fail)
                     char_w[i, j] = w
                     key = (C_SYMBOL[cs], DP_SYMBOL[d_state], DP_SYMBOL[p_state])
                     self.combo_counts[key] = self.combo_counts.get(key, 0) + 1
                 self.total_samples += 1
             else:
-                # 快速路径: 仅C状态
+                # 快速路径: 仅 C 状态
                 for j in range(CAPTCHA_LENGTH):
                     if hit_mask[i, j]:
                         if conf[i, j] >= C_CONF_HI:
@@ -474,9 +501,9 @@ class MultiOCRAdaptive:
                     elif near_mask[i, j]:
                         cs = C_NEAR
                     else:
-                        cs = C_MISS   # 无D/P无法判定peer, 不虚构
+                        cs = C_MISS   # 无 D/P 无法判定 peer, 不虚构
                     if phase_c and cs == C_NEAR:
-                        cs = C_HIT    # v27: 混淆对内 NEAR=目标态
+                        cs = C_HIT    # 混淆对内 NEAR=目标态
                     char_w[i, j] = max(W_FAST[cs], W_FLOOR)
                     self.fast_c_counts[C_SYMBOL[cs]] = self.fast_c_counts.get(C_SYMBOL[cs], 0) + 1
                 self.total_fast += 1
@@ -491,20 +518,24 @@ class MultiOCRAdaptive:
             "valid_ratio": valid_ratio,
             "n_full": len(full_idx),
             "n_fast": B - len(full_idx),
+            "len_fail_mask": len_fail_mask,
+            "len_fail_ratio": float(len_fail_mask.float().mean()),
+            "pair_mask": pair_mask,
+            "pair_ratio": float(pair_mask.float().mean()),
         }
         return char_w, info
 
     # ─────────────────────────────────────────────────────
-    #  外层自适应λ (欺骗检测, 与v22分层判定一致)
+    #  外层自适应权重 (欺骗检测)
     # ─────────────────────────────────────────────────────
     def check_and_update(self, generated_images, labels):
         """
-        检查生成图像的OCR准确率，更新权重
+        检查生成图像的 OCR 准确率, 更新外层权重。
 
         Returns:
             current_weight, accuracies, is_cheating, cheating_models
         """
-        # v26守卫: 第三方OCR未加载 (Phase A) 时不做欺骗检测, 权重保持
+        # 第三方 OCR 未加载 (Phase A) 时不做欺骗检测, 权重保持
         if not self._third_party_loaded:
             self.weight_history.append(self.current_weight)
             return self.current_weight, {}, False, []
@@ -526,7 +557,6 @@ class MultiOCRAdaptive:
 
         self.total_checks += 1
 
-        # 分层欺骗判定
         is_cheating = self._determine_cheating(cheating_models)
 
         if is_cheating:
@@ -545,8 +575,9 @@ class MultiOCRAdaptive:
         return self.current_weight, accuracies, is_cheating, cheating_models
 
     def _evaluate_ocr_accuracy(self, name, ocr_model, images, labels):
-        """评估OCR模型在生成图像上的整串准确率"""
+        """评估 OCR 模型在生成图像上的整串准确率"""
         if name == 'captcha_resnet':
+            self.last_len_err[name] = 0.0
             ocr_model.eval()
             with torch.no_grad():
                 logits = ocr_model(images)
@@ -557,31 +588,40 @@ class MultiOCRAdaptive:
         elif name in ('ddddocr', 'ppllocr'):
             correct = 0
             total = 0
+            len_err = 0
 
             imgs_np = ((images.cpu() * 0.5 + 0.5) * 255).byte().numpy()
             labels_np = labels.cpu().numpy()
 
-            for i in range(min(len(imgs_np), 32)):  # 只评估前32个，节省时间
+            for i in range(min(len(imgs_np), 32)):  # 仅评估前 32 张, 节省时间
                 img_bytes = self._numpy_to_bytes(imgs_np[i])
                 label_str = ''.join([CHARS[l] for l in labels_np[i]])
 
                 try:
                     pred = ocr_model.classification(img_bytes).strip().upper()
+                    if len(pred) != 4:
+                        len_err += 1
                     if len(pred) == 4 and pred == label_str:
                         correct += 1
                     total += 1
                 except Exception:
                     continue
 
+            self.last_len_err[name] = (len_err / total) if total > 0 else -1.0
+            if total > 0:
+                _rate = len_err / total
+                _prev = self.ema_len_err.get(name, -1.0)
+                self.ema_len_err[name] = (_rate if _prev is None or _prev < 0
+                                          else 0.9 * _prev + 0.1 * _rate)
             return correct / total if total > 0 else 0.0
 
         return 0.0
 
     def _determine_cheating(self, cheating_models):
         """
-        分层欺骗判定
-        - ppllocr + ddddocr 联合检测: 2个都超过阈值才算欺骗
-        - CaptchaResNet 单独检测: 1个超过阈值就算欺骗
+        分层欺骗判定:
+        - ppllocr + ddddocr 联合检测: 2 个都超过阈值才算欺骗
+        - CaptchaResNet 单独检测: 1 个超过阈值即算欺骗
         """
         third_party_cheat = []
         captcha_resnet_cheat = []
@@ -598,11 +638,11 @@ class MultiOCRAdaptive:
         return third_party_is_cheating or captcha_resnet_is_cheating
 
     def _numpy_to_bytes(self, img_np):
-        """将numpy图像转换为bytes"""
+        """将 numpy 图像转换为 JPEG bytes"""
         from PIL import Image
         import io
 
-        img = Image.fromarray(img_np[0], mode='L')  # (H, W)
+        img = Image.fromarray(img_np[0])  # (H, W), 单通道灰度
         buf = io.BytesIO()
         img.save(buf, format='JPEG')
         return buf.getvalue()
@@ -618,7 +658,7 @@ class MultiOCRAdaptive:
             "total_checks": self.total_checks,
             "base_accuracies": dict(self.base_accuracies),
             "cheat_rate": {name: count / max(self.total_checks, 1)
-                          for name, count in self.cheat_counts.items()},
+                           for name, count in self.cheat_counts.items()},
             "combo_counts": dict(self.combo_counts),
             "fast_c_counts": dict(self.fast_c_counts),
             "total_samples": self.total_samples,
@@ -628,7 +668,7 @@ class MultiOCRAdaptive:
         }
 
     def get_summary(self):
-        """获取摘要"""
+        """获取一行式摘要 (供训练日志打印)"""
         status = self.get_status()
         parts = [f"OCR权重={status['current_weight']:.4f}"]
 
@@ -673,30 +713,8 @@ class MultiOCRAdaptive:
         return distribution
 
 
-# ============== 使用说明 ==============
-"""
-v25 字符级证据权重表:
-
-主表 96 格 (C六态 × D四态 × P四态), 快速路径 6 格 (仅C):
-- 三中 (hit/hit): 0.90-1.00 (强可读性证据)
-- 一中一歧义: 0.55-0.90
-- 双歧义 (混淆对共识): 0.29-0.78 (标签本身可能错, 半信任)
-- 共识错读 (D!P!): 0.40-0.98 (可读但内容错, CE"改内容"方向被验证)
-- 单中: 0.40-0.78
-- 仅C命中: 0.12-0.20 (过拟合/欺骗嫌疑, M_cheat再×0.5)
-- 全未中: 0.08 地板 (破死锁, 有微弱梯度但绝不信任)
-
-修正因子:
-- M_len  : 串长≠4 → ×0.85/个 (下限0.65), 结构不可信
-- M_cheat: C高置信独苗 → ×0.50, 典型对抗样本签名
-- M_cons : D==P错读共识 → ×1.10 (cap 0.95)
-
-外层自适应λ (0.02-0.15) 独立于此表, w_final = w_table × λ.
-"""
-
-
 if __name__ == "__main__":
-    print("OCR 字符级证据权重表 (v25)")
+    print("OCR 字符级证据权重表")
     print("=" * 50)
 
     print("\nOCR基准准确率:")
